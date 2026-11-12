@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import { useRouter } from "next/navigation";
-import { collection, deleteDoc, doc, getDocs, query, setDoc, where } from "firebase/firestore";
+import { collection, deleteDoc, doc, getDocs, setDoc } from "firebase/firestore";
 import {
   AlertCircle,
   ChevronRight,
@@ -21,23 +21,12 @@ import {
   X,
 } from "lucide-react";
 import { db } from "@/lib/firebase/client";
-import { getGuestId } from "@/lib/guest";
+import { useTeamAccess } from "@/components/auth/TeamAccessProvider";
+import { ASPECT_RATIOS, mapSharedDrafts, type AspectRatio, type SharedDraft } from "@/lib/projects/shared-drafts";
 import { deleteVideoFromOPFS, getVideoFromOPFS, saveVideoToOPFS } from "@/lib/video/opfs";
+import { persistLocalFirstProject } from "@/lib/projects/local-first";
 
-const ASPECT_RATIOS = ["9:16", "16:9", "1:1", "4:5"] as const;
-type AspectRatio = (typeof ASPECT_RATIOS)[number];
-type Draft = {
-  id: string;
-  topic: string;
-  brandName: string;
-  status: string;
-  createdAt: number;
-  aspectRatio: AspectRatio;
-};
-
-function isAspectRatio(value: unknown): value is AspectRatio {
-  return typeof value === "string" && ASPECT_RATIOS.some((ratio) => ratio === value);
-}
+type Draft = SharedDraft;
 
 async function createVideoThumbnail(file: File): Promise<string> {
   const url = URL.createObjectURL(file);
@@ -90,7 +79,7 @@ async function createVideoThumbnail(file: File): Promise<string> {
 export default function Dashboard() {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [guestId, setGuestId] = useState("");
+  const { user } = useTeamAccess();
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -103,23 +92,12 @@ export default function Dashboard() {
   const [isCreating, setIsCreating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
-  const fetchDrafts = useCallback(async (ownerId: string) => {
+  const fetchDrafts = useCallback(async () => {
     setLoadError(null);
     setLoading(true);
     try {
-      const draftsQuery = query(collection(db, "drafts"), where("createdBy", "==", ownerId));
-      const snapshot = await getDocs(draftsQuery);
-      const fetched = snapshot.docs.map((entry) => {
-        const data = entry.data();
-        return {
-          id: typeof data.id === "string" ? data.id : entry.id,
-          topic: typeof data.topic === "string" ? data.topic : "Untitled Video",
-          brandName: typeof data.brandName === "string" ? data.brandName : "CreatorOS Edit",
-          status: typeof data.status === "string" ? data.status : "in_progress",
-          createdAt: typeof data.createdAt === "number" ? data.createdAt : 0,
-          aspectRatio: isAspectRatio(data.aspectRatio) ? data.aspectRatio : "9:16",
-        } satisfies Draft;
-      }).sort((first, second) => second.createdAt - first.createdAt);
+      const snapshot = await getDocs(collection(db, "drafts"));
+      const fetched = mapSharedDrafts(snapshot.docs);
       setDrafts(fetched);
       setLoading(false);
 
@@ -142,44 +120,42 @@ export default function Dashboard() {
   }, []);
 
   useEffect(() => {
-    try {
-      setGuestId(getGuestId());
-    } catch (error: unknown) {
-      setLoadError(error instanceof Error ? error.message : "Could not open your local workspace.");
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (guestId) void fetchDrafts(guestId);
-  }, [fetchDrafts, guestId]);
+    void fetchDrafts();
+  }, [fetchDrafts]);
 
   const createProject = async (file: File, aspectRatio: AspectRatio) => {
     setUploadError(null);
     setIsCreating(true);
     const draftId = crypto.randomUUID();
+    let mediaSavedLocally = false;
     try {
-      const ownerId = guestId || getGuestId();
-      if (!await saveVideoToOPFS(draftId, file)) throw new Error("Could not save this video to local storage.");
+      if (!user) throw new Error("Authentication is not ready. Retry after signing in.");
       const topic = file.name.replace(/\.[^.]+$/, "") || "Untitled Video";
-      try {
+      await persistLocalFirstProject(
+        async () => {
+          const saved = await saveVideoToOPFS(draftId, file);
+          mediaSavedLocally = saved;
+          return saved;
+        },
+        async () => {
         await setDoc(doc(db, "drafts", draftId), {
           id: draftId,
           brandName: "CreatorOS Edit",
           topic,
-          createdBy: ownerId,
+          createdBy: user.uid,
           createdAt: Date.now(),
           status: "in_progress",
           aspectRatio,
         });
-      } catch (error: unknown) {
-        await deleteVideoFromOPFS(draftId);
-        throw error;
-      }
+        },
+      );
       router.push(`/studio?draftId=${encodeURIComponent(draftId)}&format=${encodeURIComponent(aspectRatio)}&topic=${encodeURIComponent(topic)}`);
     } catch (error: unknown) {
       console.error("Could not create a project from this video:", error);
-      setUploadError(error instanceof Error ? error.message : "Could not create this project.");
+      const message = error instanceof Error ? error.message : "Could not create this project.";
+      setUploadError(mediaSavedLocally
+        ? `${message} The video remains saved locally on this device; shared project metadata was not saved.`
+        : message);
       setIsCreating(false);
     }
   };
@@ -189,13 +165,13 @@ export default function Dashboard() {
     setUploadError(null);
     const draftId = crypto.randomUUID();
     try {
-      const ownerId = guestId || getGuestId();
+      if (!user) throw new Error("Authentication is not ready. Retry after signing in.");
       const topic = "Untitled Video";
       await setDoc(doc(db, "drafts", draftId), {
         id: draftId,
         brandName: "CreatorOS Edit",
         topic,
-        createdBy: ownerId,
+        createdBy: user.uid,
         createdAt: Date.now(),
         status: "in_progress",
         aspectRatio: selectedRatio,
@@ -315,7 +291,7 @@ export default function Dashboard() {
           {loadError && (
             <div role="alert" className="flex flex-col items-start gap-3 rounded-2xl border border-red-500/25 bg-red-500/10 p-4 text-sm text-red-200 sm:flex-row sm:items-center sm:justify-between">
               <span>Could not load recent projects: {loadError}</span>
-              {guestId && <button type="button" onClick={() => void fetchDrafts(guestId)} className="rounded-lg border border-red-300/30 px-3 py-1.5 text-xs font-semibold hover:bg-red-500/10">Retry</button>}
+              <button type="button" onClick={() => void fetchDrafts()} className="rounded-lg border border-red-300/30 px-3 py-1.5 text-xs font-semibold hover:bg-red-500/10">Retry</button>
             </div>
           )}
           {loading ? (

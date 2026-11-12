@@ -2,7 +2,6 @@
 const nextConfig = {
   outputFileTracingRoot: __dirname,
   reactStrictMode: true,
-  serverExternalPackages: ["ffmpeg-static"],
   experimental: {
     serverActions: { bodySizeLimit: "20mb" },
   },

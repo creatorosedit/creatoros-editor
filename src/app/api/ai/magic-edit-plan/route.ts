@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createTextCompletion } from "@/lib/ai/openrouter";
+import { generateGeminiJson } from "@/lib/ai/gemini";
+import { freeQuotaResponse } from "@/lib/ai/provider-policy";
+import { authorizeTeamRequest, readJsonBody } from "@/lib/api/team-api-auth";
 import { SUPPORTED_CAPABILITIES } from "@/lib/video/capabilities";
 import { EditingPlanSchema, type EditingIntensity } from "@/types/editing-plan";
 import { z } from "zod";
+import { SYSTEM_PROMPT } from "@/lib/ai/system-prompt";
+
 
 export const runtime = "nodejs";
 
@@ -10,8 +14,10 @@ const RequestSchema = z.object({
   scriptLines: z.array(z.string().trim().min(1).max(2_000)).min(1).max(2_000),
   transcript: z.array(z.unknown()).max(100_000),
   duration: z.number().finite().positive().max(86_400),
+  chunkIndex: z.number().optional().default(1),
+  totalChunks: z.number().optional().default(1),
+  previousPlan: z.unknown().optional(),
   intensity: z.enum(["subtle", "professional", "dynamic"]),
-  aiModel: z.enum(["groq", "openrouter"]),
   currentPlan: z.unknown().optional(),
   userMessage: z.string().trim().min(1).max(2_000).optional(),
 }).strict();
@@ -45,25 +51,7 @@ class PlanValidationError extends Error {
   }
 }
 
-const SYSTEM_PROMPT = (intensity: EditingIntensity, duration: number) => `ROLE: You are an advanced AI Video Editing Director and Professional Film Editor.
-TASK: Analyze the transcript and generate a professional editing plan.
-INTENSITY PROFILE: ${intensity} (Subtle = minimal, Professional = balanced, Dynamic = aggressive).
-CAPABILITIES: You can ONLY use these features: A-Roll Zooms (V1), B-Roll PNG/Images/PIP (V2), Background Music (A2), SFX (A1).
-RULES:
-- Do NOT generate text or captions.
-- The video duration is ${duration} seconds. All timestamps MUST be within 0 to ${duration}.
-- Choose B-Roll search queries that match the spoken context.
-- Output ONLY a valid JSON object matching the UniversalEditingPlan schema.
-Schema:
-{
-  "project": { "duration": ${duration}, "aspect_ratio": "9:16", "video_profile": "short_form", "intensity": "${intensity}" },
-  "timeline_operations": [
-    { "id": "1", "type": "zoom", "start_time": 0, "end_time": 2, "track": "v1", "details": { "effect": "punch_in", "scale": 1.15 } },
-    { "id": "2", "type": "broll", "start_time": 2, "end_time": 5, "track": "v2", "details": { "layout": "pip", "searchQuery": "tired mother", "assetType": "png" } },
-    { "id": "3", "type": "sfx", "start_time": 2, "end_time": 2.5, "track": "a1", "details": { "searchQuery": "whoosh", "volume": 50 } },
-    { "id": "4", "type": "music", "start_time": 0, "end_time": ${duration}, "track": "a2", "details": { "mood": "emotional", "searchQuery": "soft piano", "volume": 20 } }
-  ]
-}`;
+
 
 function validateCapabilities(plan: z.infer<typeof EditingPlanSchema>, duration: number, intensity: EditingIntensity) {
   const issues: Array<{ path: Array<string | number>; message: string }> = [];
@@ -167,37 +155,40 @@ function parsePlan(response: string, duration: number, intensity: EditingIntensi
 }
 
 export async function POST(request: NextRequest) {
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Request body must be valid JSON." }, { status: 400 });
-  }
-  const parsedRequest = RequestSchema.safeParse(body);
+  const authorization = await authorizeTeamRequest(request);
+  if (!authorization.ok) return authorization.response;
+  const body = await readJsonBody(request, 8 * 1024 * 1024);
+  if (!body.ok) return body.response;
+  const parsedRequest = RequestSchema.safeParse(body.body);
   if (!parsedRequest.success) {
     return NextResponse.json({
-      error: "Provide script lines, transcript data, a valid duration, intensity, and AI model.",
+      error: "Provide script lines, transcript data, a valid duration, and intensity.",
       details: parsedRequest.error.issues,
     }, { status: 400 });
   }
 
-  const { scriptLines, transcript, duration, intensity, aiModel, currentPlan, userMessage } = parsedRequest.data;
+  const { scriptLines, transcript, duration, intensity, currentPlan, userMessage } = parsedRequest.data;
+  const { chunkIndex, totalChunks, previousPlan } = parsedRequest.data;
   const userContext = {
     scriptLines,
     transcript,
     duration,
+    chunkInfo: `Editing Chunk ${chunkIndex} of ${totalChunks}`,
+    ...(previousPlan ? { previousPlan } : {}),
     ...(currentPlan ? { currentPlan } : {}),
     ...(userMessage ? { userMessage } : {}),
   };
   try {
-    const content = await createTextCompletion([
-      { role: "system", content: SYSTEM_PROMPT(intensity, duration) },
-      { role: "user", content: JSON.stringify(userContext) },
-    ], { temperature: 0.2, json: true, preferredProvider: aiModel }, (response) => {
-      parsePlan(response, duration, intensity);
-    });
+    const content = await generateGeminiJson(
+      JSON.stringify(userContext),
+      SYSTEM_PROMPT(intensity, duration) + (totalChunks > 1 ? `\n\nCRITICAL: This video is split into ${totalChunks} parts. You are editing PART ${chunkIndex}.` : ""),
+      {},
+      request.signal,
+    );
     return NextResponse.json(parsePlan(content, duration, intensity));
   } catch (error: unknown) {
+    const quotaResponse = freeQuotaResponse(error);
+    if (quotaResponse) return quotaResponse;
     if (error instanceof PlanValidationError) {
       return NextResponse.json({ error: error.message, details: error.details }, { status: 400 });
     }

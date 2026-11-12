@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createTextCompletion } from "@/lib/ai/openrouter";
+import { generateGeminiJson, parseGeminiJson } from "@/lib/ai/gemini";
+import { freeQuotaResponse, isFreeQuotaExhaustedError } from "@/lib/ai/provider-policy";
+import { resolveWordIndexRange, throwIfAborted } from "@/lib/video/auto-cut";
+import { authorizeTeamRequest, readJsonBody } from "@/lib/api/team-api-auth";
 import { z } from "zod";
 
 export const runtime = "nodejs";
@@ -8,7 +11,7 @@ const TranscriptWordSchema = z.object({
   word: z.string().min(1),
   start: z.number().finite().nonnegative(),
   end: z.number().finite().nonnegative(),
-}).refine((word) => word.end >= word.start);
+}).refine((word) => word.end > word.start);
 
 const SilenceSegmentSchema = z.object({
   start: z.number().finite().nonnegative(),
@@ -17,16 +20,28 @@ const SilenceSegmentSchema = z.object({
 
 const RequestSchema = z.object({
   script: z.string().trim().min(1).max(50_000),
-  transcriptText: z.string().min(1).max(250_000),
   transcriptWords: z.array(TranscriptWordSchema).min(1).max(100_000),
   silenceSegments: z.array(SilenceSegmentSchema).max(100_000).optional().default([]),
   scriptLines: z.array(z.string().trim().min(1)).min(1).max(2_000).optional(),
-});
+  timelineDuration: z.number().finite().positive().optional(),
+}).strict();
 
 const CleanScriptRequestSchema = z.object({
   action: z.literal("clean-script"),
   script: z.string().trim().min(1).max(50_000),
-});
+}).strict();
+
+const CleanScriptResponseSchema = z.object({
+  lines: z.array(z.string().trim().min(1)).min(1).max(2_000),
+}).strict();
+
+const CleanScriptGeminiSchema = {
+  type: "OBJECT",
+  properties: {
+    lines: { type: "ARRAY", items: { type: "STRING" } },
+  },
+  required: ["lines"],
+} as const;
 
 interface WordRange {
   startIndex: number;
@@ -35,6 +50,8 @@ interface WordRange {
 
 interface AnnotatedWordRange extends WordRange {
   isSuggestedCut: boolean;
+  explanation?: string;
+  bestTake?: WordRange;
 }
 
 interface ScriptMatch extends WordRange {
@@ -49,7 +66,58 @@ interface TranscriptSegment {
   end: number;
   isSuggestedCut: boolean;
   reason: "silence" | "retake" | null;
+  explanation?: string;
+  bestTakeText?: string;
 }
+
+const GeminiFindingSchema = z.object({
+  startWordIndex: z.number().int().nonnegative(),
+  endWordIndex: z.number().int().nonnegative(),
+  category: z.enum(["filler", "false_start", "repeated_take", "retake"]),
+  confidence: z.number().min(0).max(1),
+  explanation: z.string().trim().min(1).max(240),
+  bestTakeStartWordIndex: z.number().int(),
+  bestTakeEndWordIndex: z.number().int(),
+}).strict();
+
+const GeminiFindingsSchema = z.object({
+  findings: z.array(GeminiFindingSchema).max(100),
+}).strict();
+
+const GeminiFindingsResponseSchema = {
+  type: "OBJECT",
+  properties: {
+    findings: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          startWordIndex: { type: "INTEGER" },
+          endWordIndex: { type: "INTEGER" },
+          category: { type: "STRING", enum: ["filler", "false_start", "repeated_take", "retake"] },
+          confidence: { type: "NUMBER" },
+          explanation: { type: "STRING" },
+          bestTakeStartWordIndex: { type: "INTEGER" },
+          bestTakeEndWordIndex: { type: "INTEGER" },
+        },
+        required: [
+          "startWordIndex",
+          "endWordIndex",
+          "category",
+          "confidence",
+          "explanation",
+          "bestTakeStartWordIndex",
+          "bestTakeEndWordIndex",
+        ],
+      },
+    },
+  },
+  required: ["findings"],
+} as const;
+
+const GEMINI_CHUNK_WORDS = 320;
+const GEMINI_CHUNK_OVERLAP = 32;
+const GEMINI_MAX_WORDS = 1_280;
 
 function normalizeWord(word: string): string {
   return word.toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
@@ -79,39 +147,23 @@ function splitLongScriptLines(lines: string[], maxWords = 12): string[] {
   });
 }
 
-async function cleanScriptWithAI(script: string): Promise<string[]> {
+async function cleanScriptWithAI(script: string, signal: AbortSignal): Promise<string[]> {
   const fallback = () => splitLongScriptLines(splitScriptByPunctuation(script));
-  const prompt = "Split the script into natural spoken lines. Split at every sentence ending (., ?, !) AND at natural pause points where the speaker would take a breath. Each line should be a single complete thought. Return ONLY a JSON object with a 'lines' array of strings. Keep lines short (5-12 words). You MUST return a valid JSON object with a non-empty lines array. If the script is short, return it as a single line.";
-  const validate = (content: string) => {
-    const result: unknown = JSON.parse(content.trim());
-    if (
-      typeof result !== "object" ||
-      result === null ||
-      !("lines" in result) ||
-      !Array.isArray(result.lines) ||
-      !result.lines.every((line) => typeof line === "string")
-    ) {
-      throw new Error("AI returned an invalid script-lines array.");
-    }
-    if (splitLongScriptLines(result.lines.map((line) => line.trim()).filter(Boolean)).length === 0) {
-      throw new Error("AI returned no script lines.");
-    }
-  };
-
   try {
-    const content = await createTextCompletion(
-      [{ role: "user", content: `${prompt}\n\nScript:\n${script}` }],
-      { temperature: 0, json: true },
-      validate,
+    throwIfAborted(signal);
+    const content = await generateGeminiJson(
+      `Split this script into natural spoken lines at sentence endings and likely breath pauses. Keep each line to roughly 5-12 words.\n\nScript:\n${script.slice(0, 12_000)}`,
+      "Return concise lines in the requested JSON schema. Preserve the script's original language and meaning.",
+      CleanScriptGeminiSchema,
+      signal,
     );
-    const result: unknown = JSON.parse(content.trim());
-    if (typeof result !== "object" || result === null || !("lines" in result) ||
-      !Array.isArray(result.lines) || !result.lines.every((line) => typeof line === "string")) {
-      throw new Error("AI returned an invalid script-lines array.");
-    }
-    return splitLongScriptLines(result.lines.map((line) => line.trim()).filter(Boolean));
+    throwIfAborted(signal);
+    const result = parseGeminiJson(content, (value) => CleanScriptResponseSchema.parse(value));
+    return splitLongScriptLines(result.lines);
   } catch (error: unknown) {
-    console.warn("AI script preprocessing failed; using punctuation-based splitting.", error);
+    throwIfAborted(signal);
+    if (isFreeQuotaExhaustedError(error)) throw error;
+    console.warn("Gemini script preprocessing failed; using punctuation-based splitting.", error);
     return fallback();
   }
 }
@@ -330,48 +382,6 @@ function findImmediateScriptRepetitions(
   }
 
   return repetitions;
-}
-
-function parsePhrases(response: string): string[] {
-  const parsed: unknown = JSON.parse(response.trim());
-  if (
-    typeof parsed !== "object" ||
-    parsed === null ||
-    !("phrasesToCut" in parsed) ||
-    !Array.isArray(parsed.phrasesToCut) ||
-    !parsed.phrasesToCut.every((phrase) => typeof phrase === "string")
-  ) {
-    throw new Error("AI returned invalid retake phrases.");
-  }
-  return parsed.phrasesToCut;
-}
-
-function matchPhrasesToWords(phrases: string[], words: z.infer<typeof TranscriptWordSchema>[]): WordRange[] {
-  const normalizedWords = words.map((word) => normalizeWord(word.word));
-  const ranges: WordRange[] = [];
-  const usedWords = new Set<number>();
-  const matchedPhrases = new Set<string>();
-
-  for (const phrase of phrases) {
-    const phraseWords = phrase.split(/\s+/u).map(normalizeWord).filter(Boolean);
-    if (phraseWords.length === 0) continue;
-    const phraseKey = phraseWords.join(" ");
-    if (matchedPhrases.has(phraseKey)) continue;
-
-    for (let startIndex = 0; startIndex <= normalizedWords.length - phraseWords.length; startIndex += 1) {
-      if (phraseWords.some((_, phraseIndex) => usedWords.has(startIndex + phraseIndex))) continue;
-      const matches = phraseWords.every((word, phraseIndex) =>
-        normalizedWords[startIndex + phraseIndex] === word,
-      );
-      if (!matches) continue;
-      const endIndex = startIndex + phraseWords.length - 1;
-      ranges.push({ startIndex, endIndex });
-      matchedPhrases.add(phraseKey);
-      for (let index = startIndex; index <= endIndex; index += 1) usedWords.add(index);
-      break;
-    }
-  }
-  return ranges.sort((first, second) => first.startIndex - second.startIndex);
 }
 
 function matchesAt(words: string[], phrase: string[], startIndex: number): boolean {
@@ -610,6 +620,12 @@ function createTranscriptSegments(
           end: lastWord.end,
           isSuggestedCut: annotatedRange.isSuggestedCut,
           reason: annotatedRange.isSuggestedCut ? "retake" : null,
+          explanation: annotatedRange.explanation,
+          bestTakeText: annotatedRange.bestTake
+            ? words.slice(annotatedRange.bestTake.startIndex, annotatedRange.bestTake.endIndex + 1)
+              .map((word) => word.word)
+              .join(" ")
+            : undefined,
         });
         segmentIndex += 1;
       }
@@ -648,12 +664,175 @@ function createTranscriptSegments(
   return segments.sort((first, second) => first.start - second.start || first.end - second.end);
 }
 
+function getRelevantScriptContext(script: string, transcriptWords: string[]): string {
+  if (script.length <= 1_500) return script;
+  const transcriptTokens = new Set(transcriptWords.map(normalizeWord).filter((word) => word.length > 2));
+  const lines = splitScriptByPunctuation(script);
+  const rankedLines = lines.map((line, index) => {
+    const tokens = line.split(/\s+/u).map(normalizeWord).filter((word) => word.length > 2);
+    return {
+      index,
+      line,
+      score: tokens.reduce((score, token) => score + Number(transcriptTokens.has(token)), 0),
+    };
+  });
+  const selected = rankedLines
+    .filter((line) => line.score > 0)
+    .sort((first, second) => second.score - first.score || first.index - second.index)
+    .slice(0, 12)
+    .sort((first, second) => first.index - second.index)
+    .map(({line}) => line)
+    .join("\n");
+  return (selected || script).slice(0, 1_500);
+}
+
+async function findGeminiCutSuggestions(
+  script: string,
+  transcriptWords: z.infer<typeof TranscriptWordSchema>[],
+  timelineDuration: number,
+  signal: AbortSignal,
+): Promise<{ ranges: AnnotatedWordRange[]; processedWords: number }> {
+  const processedWords = Math.min(transcriptWords.length, GEMINI_MAX_WORDS);
+  const wordsToAnalyze = transcriptWords.slice(0, processedWords);
+  const findings: AnnotatedWordRange[] = [];
+
+  for (let chunkStart = 0; chunkStart < wordsToAnalyze.length;) {
+    throwIfAborted(signal);
+    const chunkEnd = Math.min(wordsToAnalyze.length, chunkStart + GEMINI_CHUNK_WORDS);
+    const chunk = wordsToAnalyze.slice(chunkStart, chunkEnd);
+    const scriptContext = getRelevantScriptContext(script, chunk.map(({word}) => word));
+    const prompt = [
+      "Review this timestamped transcript excerpt against the script. Understand Hindi, Hinglish, and English.",
+      "Find only clearly removable fillers, aborted false starts, repeated sentences, or inferior retakes.",
+      "Never invent words or timestamps. Return global word indexes from the supplied transcript only.",
+      "Use supplied word times only to avoid spanning long or natural pauses; do not return timestamps.",
+      "For repeated takes, mark the inferior spoken attempt and reference the best take's word indexes.",
+      "For no best take, set both bestTake indexes to -1. Prefer no suggestion when uncertain.",
+      "Keep each finding short. Explain why in one concise sentence. Do not cut meaningful pauses, complete sentences, or incomplete speech without clear evidence.",
+      `Script context:\n${scriptContext || "(No close script phrase; use the full script intent.)"}`,
+      `Indexed timestamped transcript words:\n${chunk.map((word, offset) =>
+        `${chunkStart + offset}: ${word.word} [${word.start.toFixed(2)}-${word.end.toFixed(2)}s]`,
+      ).join("\n")}`,
+    ].join("\n\n");
+    const responseText = await generateGeminiJson(
+      prompt,
+      "You are a cautious multilingual video editor. Suggest reviewable cuts, not automatic deletions.",
+      GeminiFindingsResponseSchema,
+      signal,
+    );
+    throwIfAborted(signal);
+    const validated = parseGeminiJson(
+      responseText,
+      (value) => GeminiFindingsSchema.parse(value),
+    );
+
+    for (const finding of validated.findings) {
+      const {startWordIndex, endWordIndex} = finding;
+      if (
+        finding.confidence < 0.65 ||
+        startWordIndex < chunkStart ||
+        endWordIndex < startWordIndex ||
+        endWordIndex >= chunkEnd ||
+        endWordIndex - startWordIndex > 60
+      ) {
+        continue;
+      }
+      if (finding.category === "filler" && endWordIndex - startWordIndex > 4) continue;
+
+      const timeRange = resolveWordIndexRange(
+        transcriptWords,
+        startWordIndex,
+        endWordIndex,
+        timelineDuration,
+      );
+      if (!timeRange) continue;
+
+      const hasBestTake = finding.bestTakeStartWordIndex >= 0 && finding.bestTakeEndWordIndex >= 0;
+      const bestTakeRange = hasBestTake
+        ? resolveWordIndexRange(
+            transcriptWords,
+            finding.bestTakeStartWordIndex,
+            finding.bestTakeEndWordIndex,
+            timelineDuration,
+          )
+        : null;
+      if (
+        (finding.bestTakeStartWordIndex < 0) !== (finding.bestTakeEndWordIndex < 0) ||
+        (finding.bestTakeStartWordIndex < 0 && finding.bestTakeStartWordIndex !== -1) ||
+        (finding.bestTakeEndWordIndex < 0 && finding.bestTakeEndWordIndex !== -1) ||
+        (hasBestTake &&
+          (finding.bestTakeStartWordIndex < chunkStart ||
+            finding.bestTakeEndWordIndex < finding.bestTakeStartWordIndex ||
+            finding.bestTakeEndWordIndex >= chunkEnd ||
+            rangesOverlap(
+              {startIndex: startWordIndex, endIndex: endWordIndex},
+              {startIndex: finding.bestTakeStartWordIndex, endIndex: finding.bestTakeEndWordIndex},
+            ))) ||
+        (hasBestTake && !bestTakeRange)
+      ) {
+        continue;
+      }
+
+      findings.push({
+        startIndex: startWordIndex,
+        endIndex: endWordIndex,
+        isSuggestedCut: true,
+        explanation: finding.explanation,
+        bestTake: bestTakeRange
+          ? {
+              startIndex: finding.bestTakeStartWordIndex,
+              endIndex: finding.bestTakeEndWordIndex,
+            }
+          : undefined,
+      });
+    }
+
+    if (chunkEnd === wordsToAnalyze.length) break;
+    chunkStart = chunkEnd - GEMINI_CHUNK_OVERLAP;
+  }
+
+  const deduplicated: AnnotatedWordRange[] = [];
+  for (const finding of findings.sort((first, second) => first.startIndex - second.startIndex)) {
+    if (deduplicated.some((existing) => rangesOverlap(existing, finding))) continue;
+    deduplicated.push(finding);
+  }
+  return {ranges: deduplicated, processedWords};
+}
+
+function normalizeSilenceSegments(
+  segments: Array<{start: number; end: number}>,
+  duration: number,
+): Array<{start: number; end: number}> {
+  const sorted = segments
+    .map(({start, end}) => ({
+      start: Math.max(0, Math.min(duration, start)),
+      end: Math.max(0, Math.min(duration, end)),
+    }))
+    .filter((segment) => segment.end > segment.start)
+    .sort((first, second) => first.start - second.start);
+  const merged: Array<{start: number; end: number}> = [];
+  for (const segment of sorted) {
+    const previous = merged[merged.length - 1];
+    if (previous && segment.start <= previous.end) {
+      previous.end = Math.max(previous.end, segment.end);
+    } else {
+      merged.push(segment);
+    }
+  }
+  return merged;
+}
+
 export async function POST(request: NextRequest) {
+  const authorization = await authorizeTeamRequest(request);
+  if (!authorization.ok) return authorization.response;
+
   try {
-    const payload: unknown = await request.json();
+    const body = await readJsonBody(request, 8 * 1024 * 1024);
+    if (!body.ok) return body.response;
+    const payload = body.body;
     const cleanRequest = CleanScriptRequestSchema.safeParse(payload);
     if (cleanRequest.success) {
-      return NextResponse.json({ scriptLines: await cleanScriptWithAI(cleanRequest.data.script) });
+      return NextResponse.json({ scriptLines: await cleanScriptWithAI(cleanRequest.data.script, request.signal) });
     }
 
     const parsedRequest = RequestSchema.safeParse(payload);
@@ -661,7 +840,61 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "A script and timestamped transcript are required." }, { status: 400 });
     }
 
-    const { script, transcriptText, transcriptWords, silenceSegments, scriptLines } = parsedRequest.data;
+    const { script, transcriptWords, silenceSegments, scriptLines } = parsedRequest.data;
+    const timelineDuration = parsedRequest.data.timelineDuration ??
+      transcriptWords[transcriptWords.length - 1]?.end ?? 0;
+    if (
+      timelineDuration <= 0 ||
+      transcriptWords.some((word, index) =>
+        word.end > timelineDuration ||
+        (index > 0 && word.start < (transcriptWords[index - 1]?.start ?? 0)),
+      )
+    ) {
+      return NextResponse.json({ error: "Transcript timestamps are outside the timeline." }, { status: 400 });
+    }
+    const normalizedSilenceCuts = normalizeSilenceSegments(silenceSegments, timelineDuration);
+    const fallbackScriptLines = scriptLines ?? splitScriptByPunctuation(script);
+
+    let geminiWarning: string | null = null;
+    try {
+      const {ranges: geminiRanges, processedWords} = await findGeminiCutSuggestions(
+        script,
+        transcriptWords,
+        timelineDuration,
+        request.signal,
+      );
+      const annotatedRanges = [...geminiRanges];
+      const localPairs = [
+        ...findScriptFalseStarts(script, transcriptWords),
+        ...findScriptAwareRepetitions(script, transcriptWords),
+        ...findFuzzyScriptRepetitions(script, transcriptWords),
+      ];
+      for (const pair of localPairs) {
+        const pairRanges = [
+          {...pair.retake, isSuggestedCut: true},
+          {...pair.keep, isSuggestedCut: false},
+        ];
+        if (pairRanges.some((range) => annotatedRanges.some((existing) => rangesOverlap(range, existing)))) {
+          continue;
+        }
+        annotatedRanges.push(...pairRanges);
+      }
+      annotatedRanges.sort((first, second) => first.startIndex - second.startIndex);
+      return NextResponse.json({
+        segments: createTranscriptSegments(transcriptWords, annotatedRanges),
+        silenceCuts: normalizedSilenceCuts,
+        scriptLines: fallbackScriptLines,
+        analysisMode: "gemini",
+        ...(processedWords < transcriptWords.length
+          ? {warning: `Gemini reviewed the first ${processedWords} transcript words; local checks covered the full transcript.`}
+          : {}),
+      });
+    } catch (error: unknown) {
+      throwIfAborted(request.signal);
+      if (isFreeQuotaExhaustedError(error)) throw error;
+      geminiWarning = error instanceof Error ? error.message : "Gemini analysis is unavailable.";
+      console.warn("Gemini cut analysis unavailable; using local checks.", error);
+    }
 
     if (scriptLines) {
       const lineMatches = findScriptLineMatches(scriptLines, transcriptWords);
@@ -704,29 +937,14 @@ export async function POST(request: NextRequest) {
 
       return NextResponse.json({
         segments: createTranscriptSegments(transcriptWords, matchedRanges),
-        silenceCuts: silenceSegments,
+        silenceCuts: normalizedSilenceCuts,
         scriptLines,
+        analysisMode: "local",
+        warning: `Gemini analysis was unavailable; local retake checks were used. ${geminiWarning}`,
       });
     }
 
-    const prompt = `Compare the spoken transcript with the intended script. Identify only spoken retakes/repeated attempts that should be removed, keeping the take that best matches the script. Return a JSON object with a "phrasesToCut" array. Each entry must be an exact, contiguous phrase copied word-for-word from the transcript, including enough words to uniquely identify the unwanted take. Do not return script text that was not spoken. If there are no retakes, return {"phrasesToCut": []}.\n\nScript:\n${script}\n\nTranscript:\n${transcriptText}`;
-    const systemPrompt = `Identify spoken retakes, including false starts (aborted sentences). If the speaker says a few words, stops, and immediately restarts the sentence, treat the initial short aborted words as a retake. Always mark the earlier take as the retake and keep the later take. Return only the requested JSON object.`;
-
-    const content = await createTextCompletion(
-      [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: prompt },
-      ],
-      { temperature: 0, json: true },
-      (response) => { parsePhrases(response); },
-    );
-    const phrasesToCut = parsePhrases(content);
-
-    const modelRetakeRanges = matchPhrasesToWords(phrasesToCut, transcriptWords);
-    const annotatedRanges: AnnotatedWordRange[] = modelRetakeRanges.map((range) => ({
-      ...range,
-      isSuggestedCut: true,
-    }));
+    const annotatedRanges: AnnotatedWordRange[] = [];
     const additionalRanges = [
       ...findScriptFalseStarts(script, transcriptWords),
       ...findScriptAwareRepetitions(script, transcriptWords),
@@ -747,10 +965,17 @@ export async function POST(request: NextRequest) {
     annotatedRanges.sort((first, second) => first.startIndex - second.startIndex);
     return NextResponse.json({
       segments: createTranscriptSegments(transcriptWords, annotatedRanges),
-      silenceCuts: silenceSegments,
-      scriptLines: splitScriptByPunctuation(script),
+      silenceCuts: normalizedSilenceCuts,
+      scriptLines: fallbackScriptLines,
+      analysisMode: "local",
+      warning: `Gemini analysis was unavailable; local retake checks were used. ${geminiWarning}`,
     });
   } catch (error: unknown) {
+    if (request.signal.aborted) {
+      return NextResponse.json({error: "Transcript analysis was cancelled."}, {status: 499});
+    }
+    const quotaResponse = freeQuotaResponse(error);
+    if (quotaResponse) return quotaResponse;
     console.error("Transcript alignment failed:", error);
     const message = error instanceof Error ? error.message : String(error);
     return NextResponse.json({ error: message }, { status: 500 });

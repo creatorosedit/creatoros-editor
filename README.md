@@ -1,13 +1,12 @@
-# Editor.app
+# CreatorOS Editor
 
-## Magic Edit and asset search
+CreatorOS is a local-first video editor for a private team. Video and editing assets remain in browser OPFS; project metadata is shared through Firebase Firestore. Shared metadata does not include source media or a complete shared timeline.
 
-Magic Edit creates a reviewable Zoom, B-roll, SFX, and Music plan from the current script/transcript and video duration. Search results can be attached to plan items and are saved in the browser's Origin Private File System (OPFS).
+## Free-only integrations
 
-Asset search uses these optional server-side environment variables:
+- Firebase Anonymous Authentication and Firestore are intended to run on Spark free quotas. Quota exhaustion stops shared operations; the application does not upgrade billing.
+- AI requests use only the server-allowlisted Gemini Developer API model. Gemini's free tier is limited, and quotas or availability may change. There is no paid-provider fallback.
+- Groq transcription, OpenRouter, Pexels, Jamendo, Freesound, and external asset downloads are disabled.
+- Rendering and editing use browser-side FFmpeg. Source media is not uploaded automatically.
 
-- `PEXELS_API_KEY` for video, image, and AI-tab search
-- `JAMENDO_CLIENT_ID` for music search
-- `FREESOUND_API_KEY` for sound-effect search
-
-When a provider key is not configured, its search tab returns sample results for UI testing. Plan generation uses `OPENROUTER_API_KEY` and falls back to `GROQ_API_KEY_EDIT`.
+See [docs/free-only-policy.md](./docs/free-only-policy.md) for setup requirements, limitations, and unresolved account/deployment costs. Do not link Firebase or Gemini projects to billing for this application.

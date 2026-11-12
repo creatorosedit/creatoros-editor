@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createTextCompletion } from "@/lib/ai/openrouter";
+import { generateGeminiJson } from "@/lib/ai/gemini";
+import { freeQuotaResponse } from "@/lib/ai/provider-policy";
+import { authorizeTeamRequest, readJsonBody } from "@/lib/api/team-api-auth";
 import { z } from "zod";
 
 export const runtime = "nodejs";
@@ -12,7 +14,7 @@ const RequestSchema = z.object({
     end: z.number().finite().positive(),
   }).refine((segment) => segment.end > segment.start)).min(1).max(100_000),
   videoFormat: z.string().trim().min(1).max(16).default("9:16"),
-});
+}).strict();
 
 const BrollPlanItemSchema = z.object({
   start: z.number().finite().nonnegative(),
@@ -24,6 +26,27 @@ const BrollPlanItemSchema = z.object({
 }).refine((item) => item.end > item.start);
 
 const BrollPlanSchema = z.array(BrollPlanItemSchema).min(3).max(5);
+const BrollPlanResponseSchema = {
+  type: "OBJECT",
+  properties: {
+    items: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          start: { type: "NUMBER" },
+          end: { type: "NUMBER" },
+          layout: { type: "STRING", enum: ["full", "split", "pip"] },
+          type: { type: "STRING", enum: ["image", "png", "illustration", "3d_render"] },
+          prompt: { type: "STRING" },
+          aspectRatio: { type: "STRING" },
+        },
+        required: ["start", "end", "layout", "type", "prompt", "aspectRatio"],
+      },
+    },
+  },
+  required: ["items"],
+} as const;
 
 const SYSTEM_PROMPT = (videoFormat: string) => `You are an elite viral video editor. Analyze the transcript and suggest 3-5 B-Rolls. Return only a JSON object with an "items" array. Each item must have numeric "start" and "end" fields, a "layout" field, a "type" field, an "aspectRatio" field, and a detailed "prompt" field. Do not include markdown or extra text.
 LAYOUT: full, split, or pip.
@@ -33,33 +56,23 @@ Make prompts highly detailed with style keywords, and use illustration, png, or 
 Example: {"items":[{"start":0.5,"end":3,"layout":"pip","type":"3d_render","aspectRatio":"1:1","prompt":"A hyper-realistic 3D render of a tired mother holding a glowing phone, cinematic lighting"}]}`;
 
 export async function POST(request: NextRequest) {
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Request body must be valid JSON." }, { status: 400 });
-  }
+  const authorization = await authorizeTeamRequest(request);
+  if (!authorization.ok) return authorization.response;
+  const body = await readJsonBody(request, 8 * 1024 * 1024);
+  if (!body.ok) return body.response;
 
-  const parsedRequest = RequestSchema.safeParse(body);
+  const parsedRequest = RequestSchema.safeParse(body.body);
   if (!parsedRequest.success) {
     return NextResponse.json({ error: "Provide script lines and a valid edited transcript." }, { status: 400 });
   }
   const { scriptLines, editedTranscript, videoFormat } = parsedRequest.data;
-  const messages = [
-    { role: "system" as const, content: SYSTEM_PROMPT(videoFormat) },
-    { role: "user" as const, content: JSON.stringify({ scriptLines, editedTranscript }) },
-  ];
-
   try {
-    const content = await createTextCompletion(messages, { temperature: 0.2, json: true }, (response) => {
-      const parsed: unknown = JSON.parse(response);
-      const items = typeof parsed === "object" && parsed !== null && "items" in parsed
-        ? parsed.items
-        : undefined;
-      if (!Array.isArray(items) || !BrollPlanSchema.safeParse(items).success) {
-        throw new Error("AI returned an invalid B-Roll plan.");
-      }
-    });
+    const content = await generateGeminiJson(
+      JSON.stringify({ scriptLines, editedTranscript }),
+      SYSTEM_PROMPT(videoFormat),
+      BrollPlanResponseSchema,
+      request.signal,
+    );
     const parsed: unknown = JSON.parse(content);
     if (typeof parsed !== "object" || parsed === null || !("items" in parsed)) {
       throw new Error("AI returned an invalid B-Roll plan.");
@@ -68,6 +81,8 @@ export async function POST(request: NextRequest) {
     if (!validatedPlan.success) throw new Error("AI returned an invalid B-Roll plan.");
     return NextResponse.json(validatedPlan.data);
   } catch (error: unknown) {
+    const quotaResponse = freeQuotaResponse(error);
+    if (quotaResponse) return quotaResponse;
     console.error("B-Roll plan generation failed:", error);
     const message = error instanceof Error ? error.message : "AI returned no usable B-Roll plan.";
     return NextResponse.json({ error: message }, { status: 502 });

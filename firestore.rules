@@ -1,0 +1,49 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function hasActiveTeamMembership() {
+      return request.auth != null
+        && exists(/databases/$(database)/documents/teamMembers/$(request.auth.uid))
+        && get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get('active', false) == true
+        && get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get('role', '') in ['admin', 'member'];
+    }
+
+    function hasAdminRole() {
+      return hasActiveTeamMembership()
+        && get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.get('role', '') == 'admin';
+    }
+
+    function validNewDraft(draftId) {
+      let data = request.resource.data;
+      return data.keys().hasAll(['id', 'topic', 'createdBy', 'createdAt', 'status'])
+        && data.id is string
+        && data.id == draftId
+        && data.topic is string
+        && data.createdBy is string
+        && data.createdAt is int
+        && data.status is string;
+    }
+
+    function validDraftMetadata() {
+      let data = request.resource.data;
+      return data.get('topic', '') is string
+        && data.get('status', '') is string;
+    }
+
+    match /teamMembers/{uid} {
+      allow get: if request.auth != null && request.auth.uid == uid;
+      allow list: if hasAdminRole();
+      allow create, update, delete: if false;
+    }
+
+    match /drafts/{draftId} {
+      allow read, delete: if hasActiveTeamMembership();
+      allow create: if hasActiveTeamMembership() && validNewDraft(draftId);
+      allow update: if hasActiveTeamMembership()
+        && validDraftMetadata()
+        && request.resource.data.get('id', null) == resource.data.get('id', null)
+        && request.resource.data.get('createdBy', null) == resource.data.get('createdBy', null)
+        && request.resource.data.get('createdAt', null) == resource.data.get('createdAt', null);
+    }
+  }
+}

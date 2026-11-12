@@ -3,6 +3,7 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { Image, LoaderCircle, Music2, Pause, Play, Search, X } from "lucide-react";
 import { saveAssetToOPFS } from "@/lib/video/opfs";
+import { authenticatedApiFetch } from "@/lib/firebase/api-fetch";
 
 type SearchType = "video" | "image" | "ai" | "music" | "sfx";
 type AssetMediaType = "video" | "image" | "audio";
@@ -110,7 +111,7 @@ export default function AssetSearchPanel({
     setHasSearched(true);
     try {
       const params = new URLSearchParams({ query: query.trim(), type });
-      const response = await fetch(`/api/search?${params.toString()}`);
+      const response = await authenticatedApiFetch(`/api/search?${params.toString()}`);
       const payload: unknown = await response.json();
       if (
         !response.ok ||
@@ -166,7 +167,7 @@ export default function AssetSearchPanel({
     setDownloadingId(result.id);
     setError(null);
     try {
-      const response = await fetch(`/api/download-asset?url=${encodeURIComponent(result.url)}`);
+      const response = await authenticatedApiFetch(`/api/download-asset?url=${encodeURIComponent(result.url)}`);
       if (!response.ok) {
         const payload: unknown = await response.json();
         const message = typeof payload === "object" && payload !== null &&

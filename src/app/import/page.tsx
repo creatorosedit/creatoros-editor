@@ -5,10 +5,11 @@ import { useRouter } from "next/navigation";
 import { ArrowLeft, Upload, ClipboardPaste, CheckCircle2, AlertCircle, AlertTriangle } from "lucide-react";
 import { HandoffSchema } from "@/lib/handoff/validate";
 import { db } from "@/lib/firebase/client";
-import { getGuestId } from "@/lib/guest";
+import { useTeamAccess } from "@/components/auth/TeamAccessProvider";
 import { doc, setDoc } from "firebase/firestore";
 
 export default function ImportPage() {
+  const { user } = useTeamAccess();
   const [jsonInput, setJsonInput] = useState("");
     const [status, setStatus] = useState<{ type: 'error' | 'success' | 'warn'; title: string; message: string } | null>(null);
       const [isImporting, setIsImporting] = useState(false);
@@ -65,12 +66,13 @@ export default function ImportPage() {
                                                                                                                                                                                                                                                                           
                                                                                                                                                                                                                                                                                 // Generate unique ID
                                                                                                                                                                                                                                                                                       const draftId = crypto.randomUUID();
+                                                                                                                                                                                                                                                                                      if (!user) throw new Error("Authentication is not ready. Retry after signing in.");
                                                                                                                                                                                                                                                                                             
                                                                                                                                                                                                                                                                                                   const draftData = {
                                                                                                                                                                                                                                                                                                           id: draftId,
                                                                                                                                                                                                                                                                                                                   brandName: validation.data.brand.name,
                                                                                                                                                                                                                                                                                                                           topic: validation.data.content.topic,
-                                                                                                                                                                                                                                                                                                                                  createdBy: getGuestId(),
+                                                                                                                                                                                                                                                                                                                                   createdBy: user.uid,
                                                                                                                                                                                                                                                                                                                                           createdAt: Date.now(),
                                                                                                                                                                                                                                                                                                                                                   status: "in_progress",
                                                                                                                                                                                                                                                                                                                                                           script: validation.data.content.script,

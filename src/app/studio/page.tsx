@@ -1,56 +1,40 @@
 "use client";
+import { EffectsPanel } from "@/components/effects/EffectsPanel";
+import { CaptionPanel } from "@/components/captions/CaptionPanel";
+import { CaptionOverlay } from "@/components/captions/CaptionOverlay";
+import { AIChatPanel } from "@/components/editor/AIChatPanel";
+import {
+  buildEditorContext,
+  type EditorContext,
+  type VideoClip,
+} from "@/lib/editor/editor-context";
+import {
+  buildAudioChunkFilterGraph,
+  createSilenceReviewCandidates,
+  getAudioChunkParts,
+  getSourcePosition,
+  mapRangeAfterCuts,
+  normalizeCutRanges,
+  parseSilenceDetectionLog,
+  registerAbortCleanup,
+  reflowTimelineClips,
+  splitTimelineClips,
+  throwIfAborted,
+} from "@/lib/video/auto-cut";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { Suspense, useCallback, useEffect, useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import {useRouter, useSearchParams } from "next/navigation";
 import {
   Captions,
   ChevronLeft,
-  ChevronRight,
-  Copy,
-  Eye,
-  Layout,
-  Maximize2,
-  Music,
-  Pause,
-  Play,
-  Plus,
-  Redo2,
-  Search,
-  Scissors,
-  SkipBack,
-  SkipForward,
+  Maximize,
+  Redo,
   Sparkles,
-  Type,
-  Undo2,
+  Undo,
   Upload,
   X,
 } from "lucide-react";
 import { getVideoFromOPFS, saveVideoToOPFS } from "@/lib/video/opfs";
-import AssetSearchPanel, { type SelectedAsset } from "@/components/search/AssetSearchPanel";
-import { EditingPlanSchema, type EditingIntensity, type UniversalEditingPlan } from "@/types/editing-plan";
-
-interface VideoClip {
-  id: string;
-  start: number;
-  end: number;
-  sourceStart: number;
-  sourceEnd: number;
-  speed: number;
-  zoomEffects: ZoomEffect[];
-}
-
-interface Cut {
-  start: number;
-  end: number;
-  reason: "silence" | "retake";
-}
-
-interface TranscriptWord {
-  word: string;
-  start: number;
-  end: number;
-}
 
 interface ReviewSegment {
   id: string;
@@ -59,104 +43,14 @@ interface ReviewSegment {
   end: number;
   isSuggestedCut: boolean;
   reason: "silence" | "retake" | null;
+  explanation?: string;
+  bestTakeText?: string;
 }
 
-type BrollLayout = "full" | "split" | "pip";
-type BrollType = "image" | "video";
-
-interface BrollTransform {
-  x: number;
-  y: number;
-  scale: number;
-  rotation: number;
-}
-
-interface BrollPointer {
-  x: number;
-  y: number;
-}
-
-interface BrollGesture {
-  clipId: string;
-  transform: BrollTransform;
-  pointers: Map<number, BrollPointer>;
-  origin: BrollPointer;
-  distance: number;
-  angle: number;
-}
-
-interface EditedTranscriptSegment {
-  word: string;
-  start: number;
-  end: number;
-}
-
-interface BrollPlanItem {
-  id: string;
-  type: "broll";
-  start: number;
-  end: number;
-  layout: BrollLayout;
-  assetType: BrollType;
-  searchQuery: string;
-  enabled: boolean;
-  asset: SelectedAsset | null;
-}
-
-interface BrollClip extends Omit<BrollPlanItem, "enabled"> {
-  prompt: string;
-  aspectRatio: string;
-  url: string | null;
-  track: "v2";
-  transform: BrollTransform;
-}
-
-interface ZoomPlanItem {
-  id: string;
-  type: "zoom";
-  start: number;
-  end: number;
-  effect: "zoom_in_slow" | "zoom_out_slow" | "punch_in";
-  enabled: boolean;
-  asset: null;
-}
-
-interface AudioPlanItem {
-  id: string;
-  type: "sfx" | "music";
-  start?: number;
-  end?: number;
-  mood?: string;
-  searchQuery: string;
-  volume: number;
-  enabled: boolean;
-  asset: SelectedAsset | null;
-}
-
-type MagicEditPlanItem = BrollPlanItem | ZoomPlanItem | AudioPlanItem;
-
-interface ZoomEffect {
+interface SilenceReviewCandidate {
   id: string;
   start: number;
   end: number;
-  track: "v1";
-  effect: ZoomPlanItem["effect"];
-}
-
-interface AudioClip {
-  id: string;
-  title: string;
-  start: number;
-  end: number;
-  url: string | null;
-  volume: number;
-  track: "a1" | "a2";
-}
-
-interface PlanAssetSearch {
-  itemId: string;
-  type: "video" | "image" | "music" | "sfx";
-  query: string;
 }
 
 const PIXELS_PER_SECOND = 50;
@@ -167,22 +61,44 @@ function formatTime(time: number): string {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
-function getBrollPointerGeometry(pointers: Map<number, BrollPointer>) {
-  const points = [...pointers.values()];
-  if (points.length === 0) {
-    return { origin: { x: 0, y: 0 }, distance: 0, angle: 0 };
+async function createAbortableBlobUrl(url: string, mimeType: string, signal: AbortSignal): Promise<string> {
+  const response = await fetch(url, {signal});
+  if (!response.ok) throw new Error(`Could not load FFmpeg resource (HTTP ${response.status}).`);
+  const blobUrl = URL.createObjectURL(new Blob([await response.blob()], {type: mimeType}));
+  if (signal.aborted) {
+    URL.revokeObjectURL(blobUrl);
+    throwIfAborted(signal);
   }
-  const origin = points.reduce(
-    (center, point) => ({ x: center.x + point.x / points.length, y: center.y + point.y / points.length }),
-    { x: 0, y: 0 },
-  );
-  const first = points[0] ?? { x: 0, y: 0 };
-  const second = points[1] ?? first;
-  return {
-    origin,
-    distance: Math.hypot(second.x - first.x, second.y - first.y),
-    angle: Math.atan2(second.y - first.y, second.x - first.x) * (180 / Math.PI),
-  };
+  return blobUrl;
+}
+
+function parseCaptionTime(value: string): number | null {
+  const parts = value.replace(",", ".").split(":").map(Number);
+  if (parts.length < 2 || parts.length > 3 || parts.some((part) => !Number.isFinite(part) || part < 0)) {
+    return null;
+  }
+  const seconds = parts.reduce((total, part) => total * 60 + part, 0);
+  return Number.isFinite(seconds) ? seconds : null;
+}
+
+function parseSrt(text: string): Array<{start: number; end: number; text: string}> {
+  const captions: Array<{start: number; end: number; text: string}> = [];
+  for (const block of text.replace(/\r/gu, "").split(/\n{2,}/u)) {
+    const lines = block.split("\n");
+    const timingIndex = lines.findIndex((line) => line.includes("-->"));
+    if (timingIndex < 0) continue;
+    const timing = lines[timingIndex]?.match(
+      /((?:\d{2}:)?\d{2}:\d{2}[,.]\d{3})\s+-->\s+((?:\d{2}:)?\d{2}:\d{2}[,.]\d{3})/u,
+    );
+    if (!timing?.[1] || !timing[2]) continue;
+    const start = parseCaptionTime(timing[1]);
+    const end = parseCaptionTime(timing[2]);
+    const captionText = lines.slice(timingIndex + 1).join(" ").trim();
+    if (start !== null && end !== null && end > start && captionText) {
+      captions.push({start, end, text: captionText});
+    }
+  }
+  return captions;
 }
 
 function createClip(sourceStart: number, sourceEnd: number, start: number, speed = 1): VideoClip {
@@ -193,166 +109,142 @@ function createClip(sourceStart: number, sourceEnd: number, start: number, speed
     sourceStart,
     sourceEnd,
     speed,
-    zoomEffects: [],
   };
 }
 
-function reflowClips(clips: VideoClip[]): VideoClip[] {
-  let cursor = 0;
-  return [...clips]
-    .sort((first, second) => first.start - second.start)
-    .map((clip) => {
-      const duration = Math.max(0, (clip.sourceEnd - clip.sourceStart) / clip.speed);
-      const result = { ...clip, start: cursor, end: cursor + duration };
-      cursor = result.end;
-      return result;
-    })
-    .filter((clip) => clip.end - clip.start > 0.001);
-}
-
-function isReviewSegment(value: unknown): value is ReviewSegment {
-  if (typeof value !== "object" || value === null) return false;
-  return "id" in value &&
-    typeof value.id === "string" &&
-    "text" in value &&
-    typeof value.text === "string" &&
-    "start" in value &&
-    typeof value.start === "number" &&
-    Number.isFinite(value.start) &&
-    "end" in value &&
-    typeof value.end === "number" &&
-    Number.isFinite(value.end) &&
-    value.end > value.start &&
-    "isSuggestedCut" in value &&
-    typeof value.isSuggestedCut === "boolean" &&
-    "reason" in value &&
-    (value.reason === null || value.reason === "silence" || value.reason === "retake");
-}
-
-function isTimedCut(value: unknown): value is { start: number; end: number } {
-  if (typeof value !== "object" || value === null) return false;
-  return "start" in value &&
-    typeof value.start === "number" &&
-    Number.isFinite(value.start) &&
-    "end" in value &&
-    typeof value.end === "number" &&
-    Number.isFinite(value.end) &&
-    value.end > value.start;
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((line) => typeof line === "string");
-}
-
-function buildEditedTranscript(originalWords: TranscriptWord[], cuts: Pick<Cut, "start" | "end">[]): EditedTranscriptSegment[] {
-  const sortedCuts = cuts
-    .filter((cut) => Number.isFinite(cut.start) && Number.isFinite(cut.end) && cut.end > cut.start)
-    .sort((first, second) => first.start - second.start);
-  const mergedCuts: Array<{ start: number; end: number }> = [];
-  for (const cut of sortedCuts) {
-    const previous = mergedCuts[mergedCuts.length - 1];
-    if (previous && cut.start <= previous.end) {
-      previous.end = Math.max(previous.end, cut.end);
-    } else {
-      mergedCuts.push({ ...cut });
-    }
-  }
-
-  return originalWords
-    .filter((word) => !mergedCuts.some((cut) => word.start < cut.end && word.end > cut.start))
-    .map((word) => {
-      const shiftAmount = mergedCuts
-        .filter((cut) => cut.end <= word.start)
-        .reduce((sum, cut) => sum + cut.end - cut.start, 0);
-      return {
-        word: word.word,
-        start: word.start - shiftAmount,
-        end: word.end - shiftAmount,
-      };
-    })
-    .sort((first, second) => first.start - second.start);
-}
-
 function StudioEditor() {
+  const [brightness, setBrightness] = useState(100);
+  const [contrast, setContrast] = useState(100);
+  const [saturation, setSaturation] = useState(100);
+  const [captions, setCaptions] = useState<Array<{start: number; end: number; text: string}>>([]);
+  const [captionStyle, setCaptionStyle] = useState("classic");
+  const [isEffectsPanelOpen, setIsEffectsPanelOpen] = useState(false);
+  const [isCaptionPanelOpen, setIsCaptionPanelOpen] = useState(false);
+  const [wordsPerLine, setWordsPerLine] = useState(4);
+  const [viewMode, setViewMode] = useState<"editor" | "chat">("editor");
+  const [selectedClipTimeStr, setSelectedClipTimeStr] = useState<string | null>(null);
   const router = useRouter();
   const searchParams = useSearchParams();
   const requestedFormat = searchParams.get("format");
   const format = (["9:16", "16:9", "1:1", "4:5"] as const).find((ratio) => ratio === requestedFormat) ?? "9:16";
   const draftId = searchParams.get("draftId") ?? searchParams.get("id");
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const brollImageInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const timelineScrollerRef = useRef<HTMLDivElement>(null);
-  const reviewPreviewEndRef = useRef<number | null>(null);
-  const reviewPreviewFrameRef = useRef<number | null>(null);
   const currentTimeRef = useRef(0);
   const clipsRef = useRef<VideoClip[]>([]);
-  const brollClipsRef = useRef<BrollClip[]>([]);
-  const brollGestureRef = useRef<BrollGesture | null>(null);
-  const audioElementsRef = useRef(new Map<string, HTMLAudioElement>());
-  const failedAudioPlaybackRef = useRef(new Set<string>());
-  const assetUrlsRef = useRef(new Set<string>());
   const undoHistoryRef = useRef<VideoClip[][]>([]);
   const redoHistoryRef = useRef<VideoClip[][]>([]);
+  const projectIdRef = useRef(draftId);
+  const videoMetadataRef = useRef<{duration: number; width: number | null; height: number | null} | null>(null);
+  const autoCutControllerRef = useRef<AbortController | null>(null);
   const timelineDurationRef = useRef(0);
   const videoObjectUrlRef = useRef<string | null>(null);
+  const editorContextRef = useRef<EditorContext | null>(null);
+  const cancelAutoCut = useCallback(() => {
+    const controller = autoCutControllerRef.current;
+    autoCutControllerRef.current = null;
+    controller?.abort();
+  }, []);
 
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
-  const [sourceDuration, setSourceDuration] = useState(0);
+  const [videoMetadata, setVideoMetadata] = useState<{duration: number; width: number | null; height: number | null} | null>(null);
   const [clips, setClips] = useState<VideoClip[]>([]);
   const [timelineDuration, setTimelineDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [manualRangeStart, setManualRangeStart] = useState<number | null>(null);
+  const [manualRangeEnd, setManualRangeEnd] = useState<number | null>(null);
   const videoVolume = 1;
-  const [isSheetOpen, setIsSheetOpen] = useState(false);
-  const [script, setScript] = useState("");
-  const [scriptLines, setScriptLines] = useState<string[]>([]);
-  const [isProcessingScript, setIsProcessingScript] = useState(false);
-  const [silenceThreshold, setSilenceThreshold] = useState(0.7);
-  const [isAutoCutting, setIsAutoCutting] = useState(false);
-  const [autoCutError, setAutoCutError] = useState<string | null>(null);
+  const [minimumSilenceDuration, setMinimumSilenceDuration] = useState(0.7);
+  const [silenceThresholdDb, setSilenceThresholdDb] = useState(-35);
   const [notice, setNotice] = useState<string | null>(null);
   const [reviewSegments, setReviewSegments] = useState<ReviewSegment[]>([]);
-  const [silenceCuts, setSilenceCuts] = useState<Cut[]>([]);
+  const [silenceReview, setSilenceReview] = useState<SilenceReviewCandidate[]>([]);
   const [selectedCutIds, setSelectedCutIds] = useState<Set<string>>(new Set());
-  const [isReviewOpen, setIsReviewOpen] = useState(false);
-  const [previewingSegmentId, setPreviewingSegmentId] = useState<string | null>(null);
-  const [editedTranscript, setEditedTranscript] = useState<EditedTranscriptSegment[]>([]);
-  const [originalTranscriptWords, setOriginalTranscriptWords] = useState<TranscriptWord[]>([]);
-  const [magicEditPlan, setMagicEditPlan] = useState<MagicEditPlanItem[]>([]);
-  const [universalEditingPlan, setUniversalEditingPlan] = useState<UniversalEditingPlan | null>(null);
-  const [aiIntensity, setAiIntensity] = useState<EditingIntensity>("professional");
-  const [aiModel, setAiModel] = useState<"groq" | "openrouter">("openrouter");
-  const [brollClips, setBrollClips] = useState<BrollClip[]>([]);
-  const [audioClips, setAudioClips] = useState<AudioClip[]>([]);
-  const [isMagicEditPlanOpen, setIsMagicEditPlanOpen] = useState(false);
-  const [isGeneratingMagicEditPlan, setIsGeneratingMagicEditPlan] = useState(false);
-  const [magicEditError, setMagicEditError] = useState<string | null>(null);
-  const [magicEditMessage, setMagicEditMessage] = useState("");
-  const [magicEditChat, setMagicEditChat] = useState<Array<{ role: "user" | "assistant"; text: string }>>([]);
-  const [assetSearch, setAssetSearch] = useState<PlanAssetSearch | null>(null);
-  const [selectedBrollClipId, setSelectedBrollClipId] = useState<string | null>(null);
+  const [contextRevision, setContextRevision] = useState(0);
+  const [contextSynchronizationStatus, setContextSynchronizationStatus] =
+    useState<EditorContext["synchronizationStatus"]>("synchronized");
 
   clipsRef.current = clips;
-  brollClipsRef.current = brollClips;
   timelineDurationRef.current = timelineDuration;
+  const contextProjectMatches = projectIdRef.current === draftId;
+
+  const structuralEditorContext = useMemo(() => buildEditorContext({
+    projectId: draftId,
+    mediaId: null,
+    sourceMedia: contextProjectMatches && videoFile
+      ? {
+          filename: videoFile.name,
+          mimeType: videoFile.type || null,
+          duration: videoMetadata?.duration ?? null,
+          width: videoMetadata?.width ?? null,
+          height: videoMetadata?.height ?? null,
+        }
+      : null,
+    clips: contextProjectMatches ? clips : [],
+    timelineDuration: contextProjectMatches ? timelineDuration : 0,
+    selectedClipId: contextProjectMatches ? selectedClipId : null,
+    selectedRange: contextProjectMatches && (manualRangeStart !== null || manualRangeEnd !== null)
+      ? {in: manualRangeStart, out: manualRangeEnd}
+      : null,
+    playheadPosition: contextProjectMatches ? currentTimeRef.current : 0,
+    originalScript: null,
+    revision: contextRevision,
+    synchronizationStatus: contextProjectMatches ? contextSynchronizationStatus : "loading",
+  }), [
+    clips,
+    contextProjectMatches,
+    contextRevision,
+    contextSynchronizationStatus,
+    draftId,
+    manualRangeEnd,
+    manualRangeStart,
+    selectedClipId,
+    timelineDuration,
+    videoFile,
+    videoMetadata,
+  ]);
+  const editorContext = useMemo(
+    () => ({...structuralEditorContext, playheadPosition: currentTime}),
+    [currentTime, structuralEditorContext],
+  );
+  editorContextRef.current = editorContext;
+  const editorContextSummary = useMemo(() => ({
+    projectId: structuralEditorContext.projectId,
+    videoFilename: structuralEditorContext.videoFilename,
+    timelineClipCount: structuralEditorContext.timelineClips.length,
+    selectedClipIds: structuralEditorContext.selectedClipIds,
+    selectedRange: structuralEditorContext.selectedRange,
+    synchronizationStatus: structuralEditorContext.synchronizationStatus,
+  }), [structuralEditorContext]);
+  const getEditorContext = useCallback(() => editorContextRef.current, []);
+
+  const incrementContextRevision = useCallback(() => {
+    setContextRevision((revision) => revision + 1);
+  }, []);
 
   const updateTimelineTime = useCallback((time: number) => {
     const boundedTime = Math.max(0, Math.min(timelineDurationRef.current, time));
     currentTimeRef.current = boundedTime;
+    if (editorContextRef.current) {
+      editorContextRef.current = {...editorContextRef.current, playheadPosition: boundedTime};
+    }
     setCurrentTime(boundedTime);
   }, []);
 
   const updateClips = useCallback((nextClips: VideoClip[]) => {
+    cancelAutoCut();
     undoHistoryRef.current.push(clipsRef.current);
     redoHistoryRef.current = [];
-    const reflowed = reflowClips(nextClips);
+    const reflowed = reflowTimelineClips(nextClips);
     const nextDuration = reflowed[reflowed.length - 1]?.end ?? 0;
     clipsRef.current = reflowed;
     timelineDurationRef.current = nextDuration;
+    incrementContextRevision();
     setClips(reflowed);
     setTimelineDuration(nextDuration);
     setCurrentTime((time) => {
@@ -360,21 +252,26 @@ function StudioEditor() {
       currentTimeRef.current = boundedTime;
       return boundedTime;
     });
-  }, []);
+  }, [cancelAutoCut, incrementContextRevision]);
 
   const restoreClips = useCallback((nextClips: VideoClip[]) => {
-    const reflowed = reflowClips(nextClips);
+    cancelAutoCut();
+    const reflowed = reflowTimelineClips(nextClips);
     const nextDuration = reflowed[reflowed.length - 1]?.end ?? 0;
+    const targetTime = Math.max(0, Math.min(currentTimeRef.current, nextDuration));
     clipsRef.current = reflowed;
     timelineDurationRef.current = nextDuration;
+    incrementContextRevision();
     setClips(reflowed);
     setTimelineDuration(nextDuration);
-    setCurrentTime((time) => {
-      const boundedTime = Math.min(time, nextDuration);
-      currentTimeRef.current = boundedTime;
-      return boundedTime;
-    });
-  }, []);
+    currentTimeRef.current = targetTime;
+    setCurrentTime(targetTime);
+    const sourcePosition = getSourcePosition(reflowed, targetTime);
+    if (sourcePosition && videoRef.current) {
+      videoRef.current.currentTime = sourcePosition.sourceTime;
+      videoRef.current.playbackRate = sourcePosition.speed;
+    }
+  }, [cancelAutoCut, incrementContextRevision]);
 
   const undoClips = useCallback(() => {
     const previous = undoHistoryRef.current.pop();
@@ -390,32 +287,24 @@ function StudioEditor() {
     restoreClips(next);
   }, [restoreClips]);
 
-  const setVideoSource = useCallback((file: File) => {
+  const setVideoSource = useCallback((file: File | null) => {
+    cancelAutoCut();
     videoRef.current?.pause();
-    reviewPreviewEndRef.current = null;
-    if (reviewPreviewFrameRef.current !== null) cancelAnimationFrame(reviewPreviewFrameRef.current);
-    reviewPreviewFrameRef.current = null;
+    editorContextRef.current = null;
     if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current);
-    audioElementsRef.current.forEach((audio) => audio.pause());
-    audioElementsRef.current.clear();
-    failedAudioPlaybackRef.current.clear();
-    assetUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-    assetUrlsRef.current.clear();
-    brollClipsRef.current = [];
-    setBrollClips([]);
-    setAudioClips([]);
-    setMagicEditPlan([]);
-    setMagicEditChat([]);
-    setMagicEditError(null);
-    setAssetSearch(null);
-    setEditedTranscript([]);
-    setOriginalTranscriptWords([]);
-    setSelectedBrollClipId(null);
-    const url = URL.createObjectURL(file);
+    videoObjectUrlRef.current = null;
+    videoMetadataRef.current = null;
+    setVideoMetadata(null);
+    setReviewSegments([]);
+    setSilenceReview([]);
+    setSelectedCutIds(new Set());
+    setManualRangeStart(null);
+    setManualRangeEnd(null);
+    const url = file ? URL.createObjectURL(file) : null;
     videoObjectUrlRef.current = url;
     setVideoFile(file);
     setVideoUrl(url);
-    setSourceDuration(0);
+    incrementContextRevision();
     undoHistoryRef.current = [];
     redoHistoryRef.current = [];
     setClips([]);
@@ -423,62 +312,66 @@ function StudioEditor() {
     setCurrentTime(0);
     currentTimeRef.current = 0;
     setSelectedClipId(null);
+    setSelectedClipTimeStr(null);
     setIsPlaying(false);
-    setPreviewingSegmentId(null);
-  }, []);
+  }, [cancelAutoCut, incrementContextRevision]);
 
   useEffect(() => () => {
-    if (reviewPreviewFrameRef.current !== null) cancelAnimationFrame(reviewPreviewFrameRef.current);
+    cancelAutoCut();
     if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current);
-    assetUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
-  }, []);
+  }, [cancelAutoCut]);
 
   useEffect(() => {
-    if (!draftId) return;
     let cancelled = false;
+    if (projectIdRef.current !== draftId) {
+      projectIdRef.current = draftId;
+      incrementContextRevision();
+      setVideoSource(null);
+    }
+    setContextSynchronizationStatus(draftId ? "loading" : "synchronized");
+    if (!draftId) return () => {
+      cancelled = true;
+    };
     void getVideoFromOPFS(draftId).then((file) => {
-      if (!cancelled && file) setVideoSource(file);
+      if (cancelled) return;
+      if (file) setVideoSource(file);
+      setContextSynchronizationStatus("synchronized");
     }).catch((error: unknown) => {
       console.error("Failed to load draft video:", error);
+      if (!cancelled) setContextSynchronizationStatus("error");
     });
     return () => {
       cancelled = true;
     };
-  }, [draftId, setVideoSource]);
-
-  useEffect(() => {
-    audioClips.forEach((clip) => {
-      const audio = audioElementsRef.current.get(clip.id);
-      if (!audio || !clip.url) return;
-      const active = isPlaying && currentTime >= clip.start && currentTime < clip.end;
-      if (!active) {
-        audio.pause();
-        return;
-      }
-      const targetTime = currentTime - clip.start;
-      if (Math.abs(audio.currentTime - targetTime) > 0.25) audio.currentTime = targetTime;
-      audio.volume = clip.volume;
-      if (audio.paused && !failedAudioPlaybackRef.current.has(clip.id)) {
-        void audio.play().catch((error: unknown) => {
-          failedAudioPlaybackRef.current.add(clip.id);
-          console.error("Timeline audio playback failed:", error);
-          setNotice("Timeline audio could not be played.");
-        });
-      }
-    });
-  }, [audioClips, currentTime, isPlaying]);
+  }, [draftId, incrementContextRevision, setVideoSource]);
 
   const onVideoLoaded = useCallback((video: HTMLVideoElement) => {
     if (!Number.isFinite(video.duration) || video.duration <= 0) return;
-    setSourceDuration(video.duration);
+    const nextMetadata = {
+      duration: video.duration,
+      width: video.videoWidth > 0 ? video.videoWidth : null,
+      height: video.videoHeight > 0 ? video.videoHeight : null,
+    };
+    const previousMetadata = videoMetadataRef.current;
+    if (
+      !previousMetadata ||
+      previousMetadata.duration !== nextMetadata.duration ||
+      previousMetadata.width !== nextMetadata.width ||
+      previousMetadata.height !== nextMetadata.height
+    ) {
+      videoMetadataRef.current = nextMetadata;
+      setVideoMetadata(nextMetadata);
+      incrementContextRevision();
+    }
     if (clipsRef.current.length === 0) {
       const initialClip = createClip(0, video.duration, 0);
       clipsRef.current = [initialClip];
       timelineDurationRef.current = video.duration;
+      incrementContextRevision();
       setClips([initialClip]);
       setTimelineDuration(video.duration);
     }
-  }, []);
+  }, [incrementContextRevision]);
 
   const safePlay = useCallback((video: HTMLVideoElement) => {
     const handlePlayError = (error: unknown) => {
@@ -488,11 +381,7 @@ function StudioEditor() {
       if (errorName === "AbortError") return;
       console.error("Video playback failed:", error);
       setNotice("Video playback could not start.");
-      reviewPreviewEndRef.current = null;
-      if (reviewPreviewFrameRef.current !== null) cancelAnimationFrame(reviewPreviewFrameRef.current);
-      reviewPreviewFrameRef.current = null;
       setIsPlaying(false);
-      setPreviewingSegmentId(null);
     };
 
     try {
@@ -503,33 +392,10 @@ function StudioEditor() {
     }
   }, []);
 
-  const seekTimeline = useCallback((time: number) => {
-    const boundedTime = Math.max(0, Math.min(timelineDurationRef.current, time));
-    updateTimelineTime(boundedTime);
-    const clip = clipsRef.current.find((item) => boundedTime >= item.start && boundedTime < item.end);
-    if (clip && videoRef.current) {
-      videoRef.current.currentTime = clip.sourceStart + (boundedTime - clip.start) * clip.speed;
-      videoRef.current.playbackRate = clip.speed;
-    } else if (boundedTime >= timelineDurationRef.current) {
-      const lastClip = clipsRef.current[clipsRef.current.length - 1];
-      if (lastClip && videoRef.current) videoRef.current.currentTime = lastClip.sourceEnd;
-    }
-  }, [updateTimelineTime]);
+
 
   const onVideoTimeUpdate = useCallback((video: HTMLVideoElement) => {
     const sourceTime = video.currentTime;
-    if (reviewPreviewEndRef.current !== null) {
-      if (sourceTime >= reviewPreviewEndRef.current) {
-        reviewPreviewEndRef.current = null;
-        if (reviewPreviewFrameRef.current !== null) cancelAnimationFrame(reviewPreviewFrameRef.current);
-        reviewPreviewFrameRef.current = null;
-        video.pause();
-        setIsPlaying(false);
-        setPreviewingSegmentId(null);
-      }
-      return;
-    }
-
     const activeClipIndex = clipsRef.current.findIndex((clip) =>
       sourceTime >= clip.sourceStart && sourceTime < clip.sourceEnd,
     );
@@ -571,17 +437,12 @@ function StudioEditor() {
     const video = videoRef.current;
     if (!video) return;
     if (isPlaying) {
-      reviewPreviewEndRef.current = null;
-      if (reviewPreviewFrameRef.current !== null) cancelAnimationFrame(reviewPreviewFrameRef.current);
-      reviewPreviewFrameRef.current = null;
       video.pause();
       setIsPlaying(false);
-      setPreviewingSegmentId(null);
       return;
     }
 
     let targetTime = currentTimeRef.current;
-    failedAudioPlaybackRef.current.clear();
     if (targetTime >= timelineDurationRef.current && clipsRef.current[0]) {
       targetTime = 0;
       updateTimelineTime(0);
@@ -592,695 +453,359 @@ function StudioEditor() {
     video.playbackRate = clip.speed;
     video.volume = videoVolume;
     video.muted = false;
-    audioClips.forEach((audioClip) => {
-      if (!audioClip.url || targetTime < audioClip.start || targetTime >= audioClip.end) return;
-      const audio = audioElementsRef.current.get(audioClip.id);
-      if (!audio) return;
-      audio.currentTime = targetTime - audioClip.start;
-      audio.volume = audioClip.volume;
-      void audio.play().catch((error: unknown) => {
-        failedAudioPlaybackRef.current.add(audioClip.id);
-        console.error("Timeline audio playback failed:", error);
-        setNotice("Timeline audio could not be played.");
-      });
-    });
     safePlay(video);
     setIsPlaying(true);
-  }, [audioClips, isPlaying, safePlay, updateTimelineTime, videoVolume]);
+  }, [isPlaying, safePlay, updateTimelineTime, videoVolume]);
 
-  const extractAudioAndFindSilences = useCallback(async (file: File, threshold: number) => {
-    const [{ FFmpeg }, { toBlobURL }] = await Promise.all([
-      import("@ffmpeg/ffmpeg"),
-      import("@ffmpeg/util"),
-    ]);
+  const extractAudioInChunks = useCallback(async (
+    file: File,
+    signal: AbortSignal,
+    minDuration: number,
+    thresholdDb: number,
+  ) => {
+    const {FFmpeg, FFFSType} = await import("@ffmpeg/ffmpeg");
+    throwIfAborted(signal);
     const ffmpeg = new FFmpeg();
     const coreBaseUrl = "https://unpkg.com/@ffmpeg/core@0.12.10/dist/umd";
     const logs: string[] = [];
-    const onLog = ({ message }: { message: string }) => logs.push(message);
+    const onLog = ({message}: {message: string}) => logs.push(message);
     const extension = file.name.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase() || "mp4";
     const inputName = `input.${extension}`;
+    const inputDirectory = "/source";
+    const inputPath = `${inputDirectory}/${inputName}`;
+    const outputName = "audio-chunk.wav";
+    const timelineClips = [...clipsRef.current].sort((first, second) => first.start - second.start);
+    const timelineDuration = timelineClips[timelineClips.length - 1]?.end ?? 0;
+    if (timelineClips.length === 0 || timelineDuration <= 0) {
+      throw new Error("The video timeline is empty.");
+    }
+
+    let terminated = false;
+    let inputDirectoryCreated = false;
+    let inputMounted = false;
+    let logHandlerAttached = false;
+    let coreBlobUrl: string | null = null;
+    let wasmBlobUrl: string | null = null;
+    const terminate = () => {
+      if (terminated) return;
+      terminated = true;
+      ffmpeg.terminate();
+    };
+    const removeAbortCleanup = registerAbortCleanup(signal, terminate);
+    const detectedSilences: Array<{start: number; end: number}> = [];
 
     try {
-      await ffmpeg.load({
-        coreURL: await toBlobURL(`${coreBaseUrl}/ffmpeg-core.js`, "text/javascript"),
-        wasmURL: await toBlobURL(`${coreBaseUrl}/ffmpeg-core.wasm`, "application/wasm"),
-      });
+      coreBlobUrl = await createAbortableBlobUrl(
+        `${coreBaseUrl}/ffmpeg-core.js`,
+        "text/javascript",
+        signal,
+      );
+      wasmBlobUrl = await createAbortableBlobUrl(
+        `${coreBaseUrl}/ffmpeg-core.wasm`,
+        "application/wasm",
+        signal,
+      );
+      throwIfAborted(signal);
+      await ffmpeg.load({coreURL: coreBlobUrl, wasmURL: wasmBlobUrl});
+      throwIfAborted(signal);
+      URL.revokeObjectURL(coreBlobUrl);
+      URL.revokeObjectURL(wasmBlobUrl);
+      coreBlobUrl = null;
+      wasmBlobUrl = null;
+      const directoryCreated = await ffmpeg.createDir(inputDirectory);
+      if (!directoryCreated) {
+        throw new Error("FFmpeg could not prepare local media storage.");
+      }
+      inputDirectoryCreated = true;
+      const mounted = await ffmpeg.mount(
+        FFFSType.WORKERFS,
+        {blobs: [{name: inputName, data: file}]},
+        inputDirectory,
+      );
+      if (!mounted) {
+        throw new Error("This browser cannot process the local video without copying it into memory.");
+      }
+      inputMounted = true;
       ffmpeg.on("log", onLog);
-      await ffmpeg.writeFile(inputName, new Uint8Array(await file.arrayBuffer()));
-      await ffmpeg.exec([
-        "-i", inputName,
-        "-vn",
-        "-ar", "16000",
-        "-ac", "1",
-        "-b:a", "32k",
-        "audio.mp3",
-      ]);
-      const audioData = await ffmpeg.readFile("audio.mp3");
-      if (typeof audioData === "string") throw new Error("FFmpeg returned invalid audio data.");
-      const audioBuffer = new ArrayBuffer(audioData.byteLength);
-      new Uint8Array(audioBuffer).set(audioData);
-      const audioFile = new File([audioBuffer], "audio.mp3", { type: "audio/mpeg" });
+      logHandlerAttached = true;
+      throwIfAborted(signal);
 
-      await ffmpeg.exec([
-        "-i", inputName,
-        "-af", `silencedetect=noise=-35dB:d=${threshold}`,
-        "-f", "null",
-        "-",
-      ]);
+      const chunkDuration = 60;
+      for (let chunkStart = 0; chunkStart < timelineDuration; chunkStart += chunkDuration) {
+        throwIfAborted(signal);
+        const chunkEnd = Math.min(timelineDuration, chunkStart + chunkDuration);
+        const parts = getAudioChunkParts(timelineClips, chunkStart, chunkEnd);
+        if (parts.length === 0) continue;
+        const filterGraph = buildAudioChunkFilterGraph(parts, thresholdDb);
 
-      const output = logs.join("\n");
-      const events = [...output.matchAll(/silence_(start|end):\s*(-?\d+(?:\.\d+)?)/gu)];
-      const silenceCuts: Cut[] = [];
-      let silenceStart: number | null = null;
-      for (const event of events) {
-        const time = Number(event[2]);
-        if (!Number.isFinite(time)) continue;
-        if (event[1] === "start") silenceStart = time;
-        else if (silenceStart !== null) {
-          silenceCuts.push({ start: silenceStart, end: time, reason: "silence" });
-          silenceStart = null;
-        }
+        logs.length = 0;
+        const exitCode = await ffmpeg.exec([
+          "-i", inputPath,
+          "-filter_complex", filterGraph,
+          "-map", "[out]",
+          "-ar", "16000",
+          "-ac", "1",
+          "-c:a", "pcm_s16le",
+          outputName,
+        ]);
+        throwIfAborted(signal);
+        if (exitCode !== 0) throw new Error(`FFmpeg failed to extract audio chunk (exit ${exitCode}).`);
+        detectedSilences.push(...parseSilenceDetectionLog(
+          logs.join("\n"),
+          chunkEnd - chunkStart,
+        ).map((range) => ({
+          start: range.start + chunkStart,
+          end: range.end + chunkStart,
+        })));
+
+        await ffmpeg.deleteFile(outputName);
+        throwIfAborted(signal);
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
       }
-      if (silenceStart !== null) {
-        silenceCuts.push({ start: silenceStart, end: sourceDuration, reason: "silence" });
-      }
-      return { audioFile, silenceCuts };
+
+      return createSilenceReviewCandidates(
+        normalizeCutRanges(detectedSilences, timelineDuration),
+        timelineDuration,
+        minDuration,
+      );
     } finally {
-      ffmpeg.off("log", onLog);
-      ffmpeg.terminate();
+      try {
+        if (inputMounted) await ffmpeg.unmount(inputDirectory);
+        if (inputDirectoryCreated) await ffmpeg.deleteDir(inputDirectory);
+      } finally {
+        removeAbortCleanup();
+        if (logHandlerAttached) ffmpeg.off("log", onLog);
+        if (coreBlobUrl) URL.revokeObjectURL(coreBlobUrl);
+        if (wasmBlobUrl) URL.revokeObjectURL(wasmBlobUrl);
+        terminate();
+      }
     }
-  }, [sourceDuration]);
-
-  const transcribeAudio = useCallback(async (audioFile: File) => {
-    const formData = new FormData();
-    formData.append("audio", audioFile, audioFile.name);
-    const response = await fetch("/api/ai/whisper", { method: "POST", body: formData });
-    const result: unknown = await response.json();
-    if (
-      !response.ok ||
-      typeof result !== "object" ||
-      result === null ||
-      !("transcriptText" in result) ||
-      typeof result.transcriptText !== "string" ||
-      !("transcriptWords" in result) ||
-      !Array.isArray(result.transcriptWords)
-    ) {
-      const message = typeof result === "object" && result !== null && "error" in result &&
-        typeof result.error === "string"
-        ? result.error
-        : `Transcription failed (HTTP ${response.status}).`;
-      throw new Error(message);
-    }
-    return { transcriptText: result.transcriptText, transcriptWords: result.transcriptWords as TranscriptWord[] };
   }, []);
 
-  const applyCutsToTimeline = useCallback((cuts: { start: number; end: number }[]) => {
+  const applyCutsToTimeline = useCallback((cuts: {start: number; end: number }[]) => {
     if (cuts.length === 0) return timelineDurationRef.current;
+    const mergedCuts = normalizeCutRanges(cuts, timelineDurationRef.current);
+    if (mergedCuts.length === 0) return timelineDurationRef.current;
+    const previousTime = currentTimeRef.current;
+    const removedBeforePlayhead = mergedCuts.reduce(
+      (total, cut) => total + Math.max(0, Math.min(cut.end, previousTime) - cut.start),
+      0,
+    );
+    setManualRangeStart(null);
+    setManualRangeEnd(null);
     videoRef.current?.pause();
     setIsPlaying(false);
-    const keptClips: VideoClip[] = [];
-    for (const clip of clipsRef.current) {
-      let fragments = [{ start: clip.sourceStart, end: clip.sourceEnd }];
-      for (const cut of cuts) {
-        fragments = fragments.flatMap((fragment) => {
-          if (cut.end <= fragment.start || cut.start >= fragment.end) return [fragment];
-          const remaining = [];
-          if (cut.start > fragment.start) remaining.push({ start: fragment.start, end: cut.start });
-          if (cut.end < fragment.end) remaining.push({ start: cut.end, end: fragment.end });
-          return remaining;
-        });
-      }
-      for (const fragment of fragments) {
-        if (fragment.end - fragment.start > 0.05) {
-          keptClips.push(createClip(fragment.start, fragment.end, clip.start, clip.speed));
-        }
-      }
-    }
+    const keptClips = splitTimelineClips(clipsRef.current, mergedCuts)
+      .map((fragment) => createClip(
+        fragment.sourceStart,
+        fragment.sourceEnd,
+        fragment.start,
+        fragment.speed,
+      ));
 
     updateClips(keptClips);
     setSelectedClipId(null);
-    const nextDuration = keptClips.reduce(
-      (total, clip) => total + (clip.sourceEnd - clip.sourceStart) / clip.speed,
-      0,
-    );
-    const firstClip = reflowClips(keptClips)[0];
-    if (firstClip && videoRef.current) videoRef.current.currentTime = firstClip.sourceStart;
-    updateTimelineTime(0);
+    const nextDuration = clipsRef.current[clipsRef.current.length - 1]?.end ?? 0;
+    const targetTime = Math.max(0, Math.min(nextDuration, previousTime - removedBeforePlayhead));
+    const sourcePosition = getSourcePosition(clipsRef.current, targetTime);
+    if (sourcePosition && videoRef.current) {
+      videoRef.current.currentTime = sourcePosition.sourceTime;
+      videoRef.current.playbackRate = sourcePosition.speed;
+    }
+    updateTimelineTime(targetTime);
     return nextDuration;
   }, [updateClips, updateTimelineTime]);
 
-  const runAutoCut = async () => {
-    if (!videoFile) {
-      setAutoCutError("Import a video before running Auto-Cut.");
-      return;
-    }
-    if (!script.trim()) {
-      setAutoCutError("Enter the video script before running Auto-Cut.");
-      return;
-    }
-    if (scriptLines.length === 0) {
-      setAutoCutError("Process the script with AI before running Auto-Cut.");
-      return;
-    }
+  const analyzeTimelineCuts = useCallback(async () => {
+    if (!videoFile) throw new Error("Import a video before analyzing cuts.");
+    if (clipsRef.current.length === 0) throw new Error("There are no video clips on the timeline.");
+    if (autoCutControllerRef.current) throw new Error("Auto-Cut analysis is already running.");
 
-    setAutoCutError(null);
-    setIsAutoCutting(true);
+    const controller = new AbortController();
+    autoCutControllerRef.current = controller;
+    const {signal} = controller;
     try {
-      const { audioFile, silenceCuts } = await extractAudioAndFindSilences(videoFile, silenceThreshold);
-      const { transcriptText, transcriptWords } = await transcribeAudio(audioFile);
-      setOriginalTranscriptWords(transcriptWords);
-      const response = await fetch("/api/ai/align", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          script: script.trim(),
-          scriptLines,
-          transcriptText,
-          transcriptWords,
-          silenceSegments: silenceCuts.map(({ start, end }) => ({ start, end })),
-        }),
-      });
-      const result: unknown = await response.json();
-      if (
-        !response.ok ||
-        typeof result !== "object" ||
-        result === null ||
-        !("segments" in result) ||
-        !Array.isArray(result.segments) ||
-        !result.segments.every(isReviewSegment) ||
-        !("silenceCuts" in result) ||
-        !Array.isArray(result.silenceCuts) ||
-        !result.silenceCuts.every(isTimedCut) ||
-        !("scriptLines" in result) ||
-        !isStringArray(result.scriptLines)
-      ) {
-        const message = typeof result === "object" && result !== null && "error" in result &&
-          typeof result.error === "string"
-          ? result.error
-          : `Retake detection failed (HTTP ${response.status}).`;
-        throw new Error(message);
-      }
-      const segments = result.segments;
-      setScriptLines(result.scriptLines);
-      setReviewSegments(segments);
-      setEditedTranscript([]);
-      setSilenceCuts(result.silenceCuts.map(({ start, end }) => ({ start, end, reason: "silence" })));
-      setSelectedCutIds(new Set(segments.filter((segment) => segment.isSuggestedCut).map((segment) => segment.id)));
-      setIsSheetOpen(false);
-      setIsReviewOpen(true);
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "Auto-Cut failed.";
-      console.error("Auto-Cut failed:", error);
-      setAutoCutError(message);
+      const detectedSilences = await extractAudioInChunks(
+        videoFile,
+        signal,
+        minimumSilenceDuration,
+        silenceThresholdDb,
+      );
+      throwIfAborted(signal);
+
+      setReviewSegments([]);
+      setSelectedCutIds(new Set());
+      setSilenceReview(detectedSilences.map((range) => ({
+        id: crypto.randomUUID(),
+        ...range,
+      })));
+      const warning = "Cloud transcription is disabled; only local silence candidates are available. No cuts were applied.";
+      setNotice(`${detectedSilences.length} silence candidate${detectedSilences.length === 1 ? "" : "s"} ready to review. ${warning}`);
+      return {
+        suggestionCount: 0,
+        reviewableSilenceCount: detectedSilences.length,
+        analysisMode: "local" as const,
+        warning,
+      };
     } finally {
-      setIsAutoCutting(false);
+      if (autoCutControllerRef.current === controller) autoCutControllerRef.current = null;
     }
+  }, [extractAudioInChunks, minimumSilenceDuration, silenceThresholdDb, videoFile]);
+  const closeChat = useCallback(() => setViewMode("editor"), []);
+  const chatVideoContext = useMemo(() => ({onAnalyzeCuts: analyzeTimelineCuts}), [analyzeTimelineCuts]);
+
+  const deleteSelectedClip = () => {
+    const selectedClip = clipsRef.current.find((clip) => clip.id === selectedClipId);
+    if (!selectedClip) return;
+    const cut = {start: selectedClip.start, end: selectedClip.end};
+    videoRef.current?.pause();
+    setIsPlaying(false);
+    updateClips(clipsRef.current.filter((clip) => clip.id !== selectedClip.id));
+    setSelectedClipId(null);
+    setSelectedClipTimeStr(null);
+    setManualRangeStart(null);
+    setManualRangeEnd(null);
+    setReviewSegments((segments) => segments.flatMap((segment) =>
+      mapRangeAfterCuts(segment.start, segment.end, [cut]).map((range, index) => ({
+        ...segment,
+        id: index === 0 ? segment.id : `${segment.id}-${index}`,
+        ...range,
+      })),
+    ));
+    const nextDuration = clipsRef.current[clipsRef.current.length - 1]?.end ?? 0;
+    const targetTime = Math.min(selectedClip.start, nextDuration);
+    const targetClip = clipsRef.current.find((clip) => targetTime >= clip.start && targetTime < clip.end)
+      ?? clipsRef.current[clipsRef.current.length - 1];
+    if (targetClip && videoRef.current) {
+      videoRef.current.currentTime = targetClip.sourceStart +
+        Math.max(0, Math.min(targetClip.end - targetClip.start, targetTime - targetClip.start)) * targetClip.speed;
+    }
+    updateTimelineTime(targetTime);
+    setNotice("Selected timeline clip ripple-deleted.");
   };
 
-  const processScriptWithAI = async () => {
-    if (!script.trim()) {
-      setAutoCutError("Enter the video script before processing it.");
+  const deleteSelectedSuggestions = () => {
+    const selectedSuggestions = reviewSegments.filter((segment) => selectedCutIds.has(segment.id));
+    if (selectedSuggestions.length === 0) return;
+    const cuts = selectedSuggestions.map(({start, end}) => ({start, end}));
+    applyCutsToTimeline(cuts);
+    setReviewSegments((segments) => segments
+      .filter((segment) => !selectedCutIds.has(segment.id))
+      .flatMap((segment) => mapRangeAfterCuts(segment.start, segment.end, cuts)
+        .map((range, index) => ({
+          ...segment,
+          id: index === 0 ? segment.id : `${segment.id}-${index}`,
+          ...range,
+        }))));
+    setSelectedCutIds(new Set());
+    setNotice(`Deleted ${selectedSuggestions.length} selected retake suggestion${selectedSuggestions.length === 1 ? "" : "s"}.`);
+  };
+
+  const markManualRangeStart = () => {
+    setManualRangeStart(currentTimeRef.current);
+    setManualRangeEnd(null);
+  };
+
+  const markManualRangeEnd = () => {
+    const end = currentTimeRef.current;
+    if (manualRangeStart === null || end <= manualRangeStart) {
+      setNotice("Mark a range start first, then mark a later end.");
       return;
     }
-
-    setAutoCutError(null);
-    setIsProcessingScript(true);
-    try {
-      const response = await fetch("/api/ai/align", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "clean-script", script: script.trim() }),
-      });
-      const result: unknown = await response.json();
-      if (
-        !response.ok ||
-        typeof result !== "object" ||
-        result === null ||
-        !("scriptLines" in result) ||
-        !isStringArray(result.scriptLines) ||
-        result.scriptLines.length === 0
-      ) {
-        const message = typeof result === "object" && result !== null && "error" in result &&
-          typeof result.error === "string"
-          ? result.error
-          : `Script preprocessing failed (HTTP ${response.status}).`;
-        throw new Error(message);
-      }
-      setScriptLines(result.scriptLines);
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "Script preprocessing failed.";
-      console.error("Script preprocessing failed:", error);
-      setAutoCutError(message);
-    } finally {
-      setIsProcessingScript(false);
-    }
+    setManualRangeEnd(end);
   };
 
-  const toggleSegment = (segmentId: string) => {
-    setSelectedCutIds((selected) => {
-      const next = new Set(selected);
-      if (next.has(segmentId)) next.delete(segmentId);
-      else next.add(segmentId);
-      return next;
-    });
+  const deleteManualRange = () => {
+    if (manualRangeStart === null || manualRangeEnd === null || manualRangeEnd <= manualRangeStart) return;
+    const cut = {start: manualRangeStart, end: manualRangeEnd};
+    applyCutsToTimeline([cut]);
+    setReviewSegments((segments) => segments.flatMap((segment) =>
+      mapRangeAfterCuts(segment.start, segment.end, [cut]).map((range, index) => ({
+        ...segment,
+        id: index === 0 ? segment.id : `${segment.id}-${index}`,
+        ...range,
+      })),
+    ));
+    setSelectedCutIds(new Set());
+    setManualRangeStart(null);
+    setManualRangeEnd(null);
+    setNotice("Selected timeline range ripple-deleted.");
   };
 
-  const playReviewSegment = useCallback((segment: ReviewSegment) => {
+  const previewSuggestion = (segment: ReviewSegment) => {
+    const sourcePosition = getSourcePosition(clipsRef.current, segment.start);
     const video = videoRef.current;
-    if (!video) return;
-
-    if (previewingSegmentId === segment.id) {
-      reviewPreviewEndRef.current = null;
-      if (reviewPreviewFrameRef.current !== null) cancelAnimationFrame(reviewPreviewFrameRef.current);
-      reviewPreviewFrameRef.current = null;
-      video.pause();
-      setIsPlaying(false);
-      setPreviewingSegmentId(null);
-      return;
-    }
-
-    if (reviewPreviewFrameRef.current !== null) cancelAnimationFrame(reviewPreviewFrameRef.current);
-    reviewPreviewEndRef.current = segment.end;
-    setPreviewingSegmentId(segment.id);
-    video.pause();
-    video.currentTime = segment.start;
-    video.playbackRate = 1;
-    video.volume = videoVolume;
-    video.muted = false;
+    if (!sourcePosition || !video) return;
+    video.currentTime = sourcePosition.sourceTime;
+    video.playbackRate = sourcePosition.speed;
+    updateTimelineTime(segment.start);
     safePlay(video);
     setIsPlaying(true);
-
-    let previousPreviewTime = segment.start;
-    const monitorPlayback = () => {
-      if (reviewPreviewEndRef.current === null) return;
-      if (video.currentTime >= reviewPreviewEndRef.current) {
-        reviewPreviewEndRef.current = null;
-        reviewPreviewFrameRef.current = null;
-        video.pause();
-        setIsPlaying(false);
-        setPreviewingSegmentId(null);
-        return;
-      }
-      const activeSilence = silenceCuts.find((cut) =>
-        video.currentTime >= cut.start && previousPreviewTime < cut.end,
-      );
-      if (activeSilence) {
-        video.currentTime = activeSilence.end;
-        previousPreviewTime = activeSilence.end;
-      } else {
-        previousPreviewTime = video.currentTime;
-      }
-      reviewPreviewFrameRef.current = requestAnimationFrame(monitorPlayback);
-    };
-    reviewPreviewFrameRef.current = requestAnimationFrame(monitorPlayback);
-  }, [previewingSegmentId, safePlay, silenceCuts, videoVolume]);
-
-  const applySelectedCuts = () => {
-    const selectedCuts = reviewSegments
-      .filter((segment) => selectedCutIds.has(segment.id))
-      .map(({ start, end }) => ({ start, end }));
-    const cuts = [...selectedCuts, ...silenceCuts];
-    reviewPreviewEndRef.current = null;
-    if (reviewPreviewFrameRef.current !== null) cancelAnimationFrame(reviewPreviewFrameRef.current);
-    reviewPreviewFrameRef.current = null;
-    videoRef.current?.pause();
-    setIsPlaying(false);
-    setPreviewingSegmentId(null);
-    const newDuration = applyCutsToTimeline(cuts);
-    setEditedTranscript(buildEditedTranscript(originalTranscriptWords, cuts));
-    setIsReviewOpen(false);
-    setNotice(`Auto-Cut complete. New duration: ${newDuration.toFixed(2)}s.`);
   };
 
-  const closeReview = () => {
-    reviewPreviewEndRef.current = null;
-    if (reviewPreviewFrameRef.current !== null) cancelAnimationFrame(reviewPreviewFrameRef.current);
-    reviewPreviewFrameRef.current = null;
-    videoRef.current?.pause();
-    setIsPlaying(false);
-    setPreviewingSegmentId(null);
-    setIsReviewOpen(false);
-  };
-
-  const generateMagicEditPlan = async (userMessage?: string) => {
-    const duration = timelineDuration;
-    const contextLines = scriptLines.length > 0
-      ? scriptLines
-      : script.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
-    const transcript = editedTranscript.length > 0 ? editedTranscript : [];
-    const fallbackLines = contextLines.length > 0 ? contextLines : transcript.map((segment) => segment.word);
-    if (!duration || fallbackLines.length === 0) {
-      setMagicEditError("Import a video and add a script or transcript before creating a Magic Edit plan.");
-      setIsMagicEditPlanOpen(true);
-      return;
-    }
-
-    setMagicEditError(null);
-    setIsGeneratingMagicEditPlan(true);
-    setIsMagicEditPlanOpen(true);
-    try {
-      const response = await fetch("/api/ai/magic-edit-plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          scriptLines: fallbackLines,
-          transcript,
-          duration,
-          intensity: aiIntensity,
-          aiModel,
-          ...(userMessage && universalEditingPlan ? { currentPlan: universalEditingPlan, userMessage } : {}),
-        }),
-      });
-      const result: unknown = await response.json();
-      const validatedPlan = EditingPlanSchema.safeParse(result);
-      if (!response.ok || !validatedPlan.success) {
-        const message = typeof result === "object" && result !== null && "error" in result && typeof result.error === "string"
-          ? result.error
-          : `Magic Edit plan generation failed (HTTP ${response.status}).`;
-        throw new Error(message);
-      }
-      const plan = validatedPlan.data;
-      const nextPlan: MagicEditPlanItem[] = plan.timeline_operations.map((operation) => {
-        const previous = magicEditPlan.find((candidate) => candidate.id === operation.id);
-        const enabled = previous?.enabled ?? true;
-        const details = operation.details;
-        if (operation.type === "zoom" && operation.track === "v1") {
-          const effect = details.effect === "zoom_in" ? "zoom_in_slow"
-            : details.effect === "zoom_out" ? "zoom_out_slow"
-              : details.effect === "punch_in" ? "punch_in" : null;
-          if (!effect) throw new Error("The generated plan contains an unsupported zoom effect.");
-          return {
-            id: operation.id,
-            type: "zoom",
-            start: operation.start_time,
-            end: operation.end_time,
-            effect,
-            enabled,
-            asset: null,
-          };
-        }
-        if (operation.type === "broll" && operation.track === "v2") {
-          const layout = details.layout;
-          const searchQuery = details.searchQuery;
-          if (
-            (layout !== "full" && layout !== "split" && layout !== "pip") ||
-            typeof searchQuery !== "string" ||
-            (details.assetType !== "png" && details.assetType !== "image")
-          ) {
-            throw new Error("The generated plan contains invalid B-roll details.");
-          }
-          return {
-            id: operation.id,
-            type: "broll",
-            start: operation.start_time,
-            end: operation.end_time,
-            layout,
-            assetType: "image",
-            searchQuery,
-            enabled,
-            asset: previous?.type === "broll" ? previous.asset : null,
-          };
-        }
-        if (operation.type === "sfx" && operation.track === "a1") {
-          const { searchQuery, volume } = details;
-          if (typeof searchQuery !== "string" || typeof volume !== "number") {
-            throw new Error("The generated plan contains invalid SFX details.");
-          }
-          return {
-            id: operation.id,
-            type: "sfx",
-            start: operation.start_time,
-            end: operation.end_time,
-            searchQuery,
-            volume,
-            enabled,
-            asset: previous?.type === "sfx" ? previous.asset : null,
-          };
-        }
-        if (operation.type === "music" && operation.track === "a2") {
-          const { mood, searchQuery, volume } = details;
-          if (typeof mood !== "string" || typeof searchQuery !== "string" || typeof volume !== "number") {
-            throw new Error("The generated plan contains invalid music details.");
-          }
-          return {
-            id: operation.id,
-            type: "music",
-            start: operation.start_time,
-            end: operation.end_time,
-            mood,
-            searchQuery,
-            volume,
-            enabled,
-            asset: previous?.type === "music" ? previous.asset : null,
-          };
-        }
-        throw new Error(`The generated ${operation.type} operation uses an unsupported timeline track.`);
-      });
-      setUniversalEditingPlan(plan);
-      setMagicEditPlan(nextPlan);
-      if (userMessage) {
-        setMagicEditChat((messages) => [...messages, { role: "user", text: userMessage }, { role: "assistant", text: "Updated the edit plan." }]);
-        setMagicEditMessage("");
-      }
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "Magic Edit plan generation failed.";
-      console.error("Magic Edit plan generation failed:", error);
-      setMagicEditError(message);
-    } finally {
-      setIsGeneratingMagicEditPlan(false);
-    }
-  };
-
-  const updateMagicEditItem = (id: string, enabled: boolean) => {
-    setMagicEditPlan((items) => items.map((item) => item.id === id ? { ...item, enabled } : item));
-  };
-
-  const openAssetSearch = (item: MagicEditPlanItem) => {
-    if (item.type === "zoom") return;
-    const type = item.type === "broll" ? item.assetType : item.type === "music" ? "music" : "sfx";
-    setAssetSearch({ itemId: item.id, type, query: item.searchQuery });
-  };
-
-  const attachPlanAsset = (asset: SelectedAsset) => {
-    assetUrlsRef.current.add(asset.url);
-    if (!assetSearch) return;
-    setMagicEditPlan((items) => items.map((item) => {
-      if (item.id !== assetSearch.itemId) return item;
-      if (item.type === "broll") {
-        return { ...item, asset, assetType: asset.mediaType === "video" ? "video" : "image" };
-      }
-      if (item.type === "sfx" || item.type === "music") return { ...item, asset };
-      return item;
-    }));
-    setAssetSearch(null);
-  };
-
-  const applyMagicEditPlan = () => {
-    const enabledItems = magicEditPlan.filter((item) => item.enabled);
-    const operations = universalEditingPlan?.timeline_operations ?? [];
-    const enabledOperations = operations.filter((operation) =>
-      enabledItems.some((item) => item.id === operation.id && item.type === operation.type),
-    );
-    if (enabledItems.length === 0 || !universalEditingPlan) {
-      setMagicEditError("Turn on at least one item before applying the plan.");
-      return;
-    }
-    if (enabledOperations.length !== enabledItems.length) {
-      setMagicEditError("The reviewed plan no longer matches its timeline operations. Generate the plan again.");
-      return;
-    }
-
-    const enabledZooms = enabledOperations.flatMap((operation) => {
-      const item = enabledItems.find((candidate): candidate is ZoomPlanItem =>
-        candidate.id === operation.id && candidate.type === "zoom",
-      );
-      return operation.type === "zoom" && operation.track === "v1" && item
-        ? [{ ...item, start: operation.start_time, end: operation.end_time, track: operation.track }]
-        : [];
-    });
-    const enabledBroll = enabledOperations.flatMap((operation) => {
-      const item = enabledItems.find((candidate): candidate is BrollPlanItem =>
-        candidate.id === operation.id && candidate.type === "broll",
-      );
-      return operation.type === "broll" && operation.track === "v2" && item
-        ? [{ ...item, start: operation.start_time, end: operation.end_time, track: operation.track }]
-        : [];
-    });
-    const enabledAudio = enabledOperations.flatMap((operation) => {
-      const item = enabledItems.find((candidate): candidate is AudioPlanItem =>
-        candidate.id === operation.id && (candidate.type === "sfx" || candidate.type === "music"),
-      );
-      const track = item?.type === "music" && operation.track === "a2" ? operation.track
-        : item?.type === "sfx" && operation.track === "a1" ? operation.track : null;
-      return (operation.type === "sfx" || operation.type === "music") && item && track
-        ? [{ item, start: operation.start_time, end: operation.end_time, track }]
-        : [];
-    });
-    if (enabledZooms.length + enabledBroll.length + enabledAudio.length !== enabledItems.length) {
-      setMagicEditError("The plan contains an operation assigned to an unsupported track.");
-      return;
-    }
-
-    const zoomEffectsToApply = enabledZooms.map(({ id, start, end, track, effect }) => ({
-      id,
-      start,
-      end,
-      track,
-      effect,
-    }));
-    const nextVideoClips = clipsRef.current.map((clip) => ({
-      ...clip,
-      zoomEffects: [
-        ...clip.zoomEffects,
-        ...zoomEffectsToApply.filter((effect) => effect.start < clip.end && effect.end > clip.start),
-      ],
-    }));
-    const nextBrollClips = [
-      ...brollClips,
-      ...enabledBroll.map((item): BrollClip => ({
-        id: item.id,
-        type: "broll",
-        start: item.start,
-        end: item.end,
-        layout: item.layout,
-        assetType: item.assetType,
-        searchQuery: item.searchQuery,
-        asset: item.asset,
-        prompt: item.searchQuery,
-        aspectRatio: item.layout === "pip" ? "1:1" : format,
-        url: item.asset?.url ?? null,
-        track: item.track,
-        transform: { x: 0, y: 0, scale: 1, rotation: 0 },
-      })),
-    ];
-    const nextAudioClips = [
-      ...audioClips,
-      ...enabledAudio.map(({ item, start, end, track }) => ({
-        id: item.id,
-        title: item.asset?.title ?? item.searchQuery,
-        start,
-        end,
-        url: item.asset?.url ?? null,
-        volume: item.volume / 100,
-        track,
-      })),
-    ];
-    updateClips(nextVideoClips);
-    setBrollClips(nextBrollClips);
-    setAudioClips(nextAudioClips);
-
-    if (process.env.NODE_ENV !== "production") {
-      const finalTimelineClips = [
-        ...nextVideoClips.map((clip) => ({ ...clip, type: "video" as const, track: "v1" as const })),
-        ...nextBrollClips.map(({ id, start, end, track }) => ({ id, type: "broll" as const, start, end, track })),
-        ...nextAudioClips.map(({ id, start, end, track }) => ({
-          id,
-          type: track === "a1" ? "sfx" as const : "music" as const,
-          start,
-          end,
-          track,
+  const decideSilenceCandidates = (candidateIds: string[], accept: boolean) => {
+    const candidates = silenceReview.filter((candidate) => candidateIds.includes(candidate.id));
+    if (candidates.length === 0) return;
+    const cuts = accept
+      ? normalizeCutRanges(candidates, timelineDurationRef.current)
+      : [];
+    if (cuts.length > 0) {
+      applyCutsToTimeline(cuts);
+      setReviewSegments((segments) => segments.flatMap((segment) =>
+        mapRangeAfterCuts(segment.start, segment.end, cuts).map((range, index) => ({
+          ...segment,
+          id: index === 0 ? segment.id : `${segment.id}-${index}`,
+          ...range,
         })),
-      ];
-      console.info("Magic Edit final timeline clips:", finalTimelineClips);
+      ));
+      setSelectedCutIds(new Set());
     }
-
-    setIsMagicEditPlanOpen(false);
-    setMagicEditError(null);
-    setNotice(`Applied ${enabledOperations.length} Magic Edit item${enabledOperations.length === 1 ? "" : "s"} to the timeline.`);
+    setSilenceReview((pending) => pending
+      .filter((candidate) => !candidateIds.includes(candidate.id))
+      .flatMap((candidate) => mapRangeAfterCuts(candidate.start, candidate.end, cuts)
+        .map((range, index) => ({
+          ...candidate,
+          id: index === 0 ? candidate.id : `${candidate.id}-${index}`,
+          ...range,
+        }))));
+    setNotice(accept
+      ? `Accepted ${cuts.length} reviewed silence cut${cuts.length === 1 ? "" : "s"}. Undo is available.`
+      : `Rejected ${candidates.length} silence candidate${candidates.length === 1 ? "" : "s"}.`);
   };
 
-  const replaceBrollImage = (clipId: string, file: File) => {
-    if (!file.type.startsWith("image/")) {
-      setNotice("Choose an image file to replace this B-Roll placeholder.");
-      return;
-    }
-    const nextUrl = URL.createObjectURL(file);
-    assetUrlsRef.current.add(nextUrl);
-    setBrollClips((current) => current.map((clip) => {
-      if (clip.id !== clipId) return clip;
-      return {
-        ...clip,
-        assetType: "image",
-        url: nextUrl,
-        asset: { id: crypto.randomUUID(), title: file.name, url: nextUrl, mediaType: "image", duration: 0 },
-      };
-    }));
-  };
 
-  const updateBrollTransform = (clipId: string, updates: Partial<BrollTransform>) => {
-    setBrollClips((current) => current.map((clip) =>
-      clip.id === clipId ? { ...clip, transform: { ...clip.transform, ...updates } } : clip,
-    ));
-  };
 
-  const copyBrollPrompt = async (prompt: string) => {
-    try {
-      await navigator.clipboard.writeText(prompt);
-      setNotice("Prompt Copied!");
-    } catch (error: unknown) {
-      console.error("Could not copy B-Roll prompt:", error);
-      setNotice("Could not copy prompt.");
-    }
-  };
 
-  const startBrollGesture = (event: ReactPointerEvent<HTMLImageElement>, clip: BrollClip) => {
-    event.preventDefault();
-    event.stopPropagation();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    const currentGesture = brollGestureRef.current?.clipId === clip.id
-      ? brollGestureRef.current
-      : {
-        clipId: clip.id,
-        transform: clip.transform,
-        pointers: new Map<number, BrollPointer>(),
-        origin: { x: event.clientX, y: event.clientY },
-        distance: 0,
-        angle: 0,
-      };
-    currentGesture.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    const geometry = getBrollPointerGeometry(currentGesture.pointers);
-    currentGesture.transform = clip.transform;
-    currentGesture.origin = geometry.origin;
-    currentGesture.distance = geometry.distance;
-    currentGesture.angle = geometry.angle;
-    brollGestureRef.current = currentGesture;
-  };
 
-  const moveBrollGesture = (event: ReactPointerEvent<HTMLImageElement>) => {
-    const gesture = brollGestureRef.current;
-    if (!gesture || !gesture.pointers.has(event.pointerId)) return;
-    event.preventDefault();
-    event.stopPropagation();
-    gesture.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-    const geometry = getBrollPointerGeometry(gesture.pointers);
-    const twoPointers = gesture.pointers.size > 1;
-    const updates: Partial<BrollTransform> = {
-      x: Math.max(-100, Math.min(100, gesture.transform.x + geometry.origin.x - gesture.origin.x)),
-      y: Math.max(-100, Math.min(100, gesture.transform.y + geometry.origin.y - gesture.origin.y)),
-    };
-    if (twoPointers && gesture.distance > 0) {
-      updates.scale = Math.max(0.1, Math.min(3, gesture.transform.scale * geometry.distance / gesture.distance));
-      const rotationDelta = ((geometry.angle - gesture.angle + 540) % 360) - 180;
-      updates.rotation = Math.max(-180, Math.min(180, gesture.transform.rotation + rotationDelta));
-    }
-    updateBrollTransform(gesture.clipId, updates);
-  };
 
-  const endBrollGesture = (event: ReactPointerEvent<HTMLImageElement>) => {
-    const gesture = brollGestureRef.current;
-    if (!gesture) return;
-    gesture.pointers.delete(event.pointerId);
-    if (gesture.pointers.size === 0) {
-      brollGestureRef.current = null;
-      return;
-    }
-    const latestTransform = brollClipsRef.current.find((clip) => clip.id === gesture.clipId)?.transform;
-    if (latestTransform) gesture.transform = latestTransform;
-    const geometry = getBrollPointerGeometry(gesture.pointers);
-    gesture.origin = geometry.origin;
-    gesture.distance = geometry.distance;
-    gesture.angle = geometry.angle;
-  };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
   useEffect(() => {
     const scroller = timelineScrollerRef.current;
@@ -1301,639 +826,345 @@ function StudioEditor() {
     return () => document.removeEventListener("fullscreenchange", syncFullscreenState);
   }, [isFullscreen]);
 
-  const seekTime = useCallback((delta: number) => {
-    seekTimeline(currentTimeRef.current + delta);
-  }, [seekTimeline]);
-  const uniqueTracks = ["Video", "B-Roll", "SFX", "Music"];
-  const activeBrollClip = brollClips.find((clip) => currentTime >= clip.start && currentTime < clip.end);
+
+
+
   const activeVideoClip = clips.find((clip) => currentTime >= clip.start && currentTime < clip.end);
-  const activeZoomEffect = activeVideoClip?.zoomEffects.find((effect) =>
-    currentTime >= effect.start && currentTime < effect.end,
-  );
-  const zoomProgress = activeZoomEffect
-    ? Math.max(0, Math.min(1, (currentTime - activeZoomEffect.start) / (activeZoomEffect.end - activeZoomEffect.start)))
-    : 0;
-  const zoomScale = !activeZoomEffect
-    ? 1
-    : activeZoomEffect.effect === "zoom_in_slow"
-      ? 1 + zoomProgress * 0.12
-      : activeZoomEffect.effect === "zoom_out_slow"
-        ? 1.12 - zoomProgress * 0.12
-        : 1.16;
-  const selectedBrollClip = brollClips.find((clip) => clip.id === selectedBrollClipId);
-  const selectedVideoClip = clips.find((clip) => clip.id === selectedClipId);
+
+
+
+
+
+
+  const handleExport = () => {
+    setNotice("Video export is not implemented yet. No video was rendered or downloaded.");
+  };
+
+  const handleUndo = () => {
+    const canUndo = undoHistoryRef.current.length > 0;
+    undoClips();
+    if (canUndo) {
+      setReviewSegments([]);
+      setSelectedCutIds(new Set());
+      setSilenceReview([]);
+    }
+  };
+  const handleRedo = () => {
+    const canRedo = redoHistoryRef.current.length > 0;
+    redoClips();
+    if (canRedo) {
+      setReviewSegments([]);
+      setSelectedCutIds(new Set());
+      setSilenceReview([]);
+    }
+  };
+
+  const handleImportSRT = async (file: File) => {
+    try {
+      const importedCaptions = parseSrt(await file.text());
+      if (importedCaptions.length === 0) {
+        setNotice("The selected subtitle file contains no valid captions.");
+        return;
+      }
+      setCaptions(importedCaptions);
+      setNotice(`Imported ${importedCaptions.length} captions from ${file.name}.`);
+    } catch (error: unknown) {
+      console.error("Could not import subtitle file:", error);
+      setNotice("Could not read the selected subtitle file.");
+    }
+  };
 
   return (
-    <div className="flex flex-col h-[100dvh] bg-black text-white overflow-hidden font-sans">
+    <div className="relative flex flex-col h-[100dvh] bg-black text-white overflow-hidden font-sans">
       {/* 1. TOP BAR */}
-      <header className="h-14 flex items-center justify-between px-4 bg-[#0a0a0a] shrink-0">
-        <button type="button" onClick={() => router.back()} className="p-2"><ChevronLeft size={24} /></button>
-        <div className="text-sm font-semibold text-gray-300">{format} · 1080p</div>
-        <button type="button" className="bg-[#4ECDC4] text-black px-4 py-1.5 rounded-md text-xs font-bold">
+      <header className="h-14 flex items-center justify-between px-4 bg-[#0a0a0a] shrink-0 border-b border-zinc-800 z-10">
+        <div className="flex items-center gap-4">
+          <button onClick={() => router.back()} className="p-2 hover:bg-zinc-800 rounded-full transition">
+            <ChevronLeft size={20} />
+          </button>
+          <span className="text-sm font-medium text-zinc-300">{format} · 1080p</span>
+        </div>
+        <button onClick={() => handleExport()} className="bg-[#4ECDC4] text-black px-4 py-1.5 rounded-md font-semibold text-sm">
           Export
         </button>
       </header>
 
-      {/* 2. PREVIEW AREA */}
-      <main aria-label="Video preview" className="flex-1 relative flex items-center justify-center bg-black overflow-hidden p-2">
-        <div className="relative h-full max-h-full max-w-full border border-[#4ECDC4] bg-black" style={{ aspectRatio: format.replace(":", " / ") }}>
-          {videoUrl ? (
+      {/* 2. VIDEO PLAYER */}
+      <div className="flex-1 flex items-center justify-center p-2 relative bg-black min-h-0">
+        <div className="relative h-full max-h-full aspect-[9/16] bg-zinc-900 border border-zinc-800 overflow-hidden shadow-2xl rounded-lg">
+          {videoFile ? (
             <video
               ref={videoRef}
-              src={videoUrl}
-              preload="auto"
-              playsInline
+              src={videoUrl || undefined}
+              className="w-full h-full object-contain"
+              style={{ filter: `brightness(${brightness}%) contrast(${contrast}%) saturate(${saturation}%)` }}
               onLoadedMetadata={(event) => onVideoLoaded(event.currentTarget)}
               onTimeUpdate={(event) => onVideoTimeUpdate(event.currentTarget)}
-              className={`transition-transform duration-100 ${activeBrollClip?.layout === "split"
-                ? "absolute left-0 top-0 h-full w-1/2 object-cover"
-                : "h-full w-full object-contain"}`}
-              style={{ transform: `scale(${zoomScale})` }}
+              playsInline
               onClick={togglePlayback}
             />
           ) : (
-            <button type="button" onClick={() => fileInputRef.current?.click()} className="flex flex-col items-center justify-center h-full text-gray-500 gap-4">
-              <Upload size={40} className="text-[#4ECDC4]" />
-              <span className="text-sm">Import a video to start editing</span>
-            </button>
+            <div className="w-full h-full flex flex-col items-center justify-center text-zinc-500 text-sm">
+              <span>No video loaded</span>
+            </div>
           )}
-          {videoUrl && activeBrollClip?.url && activeBrollClip.assetType === "image" && (
-            <img
-              src={activeBrollClip.url}
-              alt={activeBrollClip.prompt}
-              onPointerDown={(event) => startBrollGesture(event, activeBrollClip)}
-              onPointerMove={moveBrollGesture}
-              onPointerUp={endBrollGesture}
-              onPointerCancel={endBrollGesture}
-              onClick={(event) => event.stopPropagation()}
-              style={{
-                transform: `translate(${activeBrollClip.transform.x}px, ${activeBrollClip.transform.y}px) scale(${activeBrollClip.transform.scale}) rotate(${activeBrollClip.transform.rotation}deg)`,
-              }}
-              className={`${
-                activeBrollClip.layout === "full"
-                  ? "absolute inset-0 w-full h-full object-cover z-20 touch-none cursor-grab active:cursor-grabbing"
-                  : activeBrollClip.layout === "split"
-                    ? "absolute right-0 top-0 w-1/2 h-full object-cover z-20 touch-none cursor-grab active:cursor-grabbing"
-                    : "absolute bottom-4 right-4 w-1/3 max-w-[150px] aspect-square rounded-lg border-2 border-white/50 shadow-lg z-20 object-cover touch-none cursor-grab active:cursor-grabbing"
-              }`}
-            />
-          )}
-          {videoUrl && activeBrollClip?.url && activeBrollClip.assetType === "video" && (
-            <video
-              src={activeBrollClip.url}
-              aria-label={activeBrollClip.prompt}
-              autoPlay
-              loop
-              muted
-              playsInline
-              className={`absolute z-20 ${
-                activeBrollClip.layout === "full"
-                  ? "inset-0 h-full w-full object-cover"
-                  : activeBrollClip.layout === "split"
-                    ? "right-0 top-0 h-full w-1/2 object-cover"
-                    : "bottom-4 right-4 aspect-square w-1/3 max-w-[150px] rounded-lg border-2 border-white/50 object-cover"
-              }`}
-            />
-          )}
-        </div>
-        {audioClips.map((clip) => (
-          clip.url ? <audio
-            key={clip.id}
-            ref={(element) => {
-              if (element) audioElementsRef.current.set(clip.id, element);
-              else audioElementsRef.current.delete(clip.id);
-            }}
-            src={clip.url}
-            preload="auto"
-          /> : null
-        ))}
-      </main>
-
-      {/* 3. PLAYBACK CONTROLS (Two thin layers) */}
-      <div className="flex flex-col shrink-0 bg-[#0a0a0a] border-b border-[#1a1a1a]">
-        <div className="h-9 flex justify-between items-center px-4 border-b border-[#1a1a1a]">
-          <div className="flex gap-4">
-            <button type="button" onClick={undoClips}><Undo2 size={16} className="text-gray-400" /></button>
-            <button type="button" onClick={redoClips}><Redo2 size={16} className="text-gray-400" /></button>
-          </div>
-          <div className="text-[11px] font-mono text-gray-400 tracking-wider">
-            {formatTime(currentTime)} / {formatTime(timelineDuration)}
-          </div>
-          <button type="button" onClick={() => setIsFullscreen(true)}><Maximize2 size={16} className="text-gray-400" /></button>
-        </div>
-        <div className="h-14 flex justify-center items-center gap-6">
-          <button type="button" onClick={() => seekTime(-1)}><SkipBack size={20} /></button>
-          <button type="button" onClick={() => seekTime(-1 / 30)}><ChevronLeft size={24} /></button>
-          <button type="button" onClick={togglePlayback} className="w-10 h-10 bg-[#222] rounded-full flex items-center justify-center">
-            {isPlaying ? <Pause size={20} fill="white" /> : <Play size={20} fill="white" className="ml-1" />}
-          </button>
-          <button type="button" onClick={() => seekTime(1 / 30)}><ChevronRight size={24} /></button>
-          <button type="button" onClick={() => seekTime(1)}><SkipForward size={20} /></button>
+          <CaptionOverlay
+            text={captions.find((caption) => currentTime >= caption.start && currentTime <= caption.end)?.text || ""}
+            style={captionStyle}
+            timelineTime={currentTime}
+            start={captions.find((caption) => currentTime >= caption.start && currentTime <= caption.end)?.start || 0}
+            end={captions.find((caption) => currentTime >= caption.start && currentTime <= caption.end)?.end || 0}
+          />
         </div>
       </div>
 
-      {/* 4. TIMELINE */}
-      <div aria-label="Video timeline" className="h-[224px] flex bg-[#121212] border-t border-[#222] shrink-0 relative overflow-hidden">
-        <div className="w-12 bg-[#0a0a0a] border-r border-[#222] flex flex-col z-10 shrink-0">
-          <div className="h-6 border-b border-[#222]"></div>
-          {uniqueTracks.map((track) => (
-            <div key={track} aria-label={`${track} track`} className="h-10 border-b border-[#222] flex items-center justify-center gap-1">
-              <Eye size={12} className="text-gray-500" />
-              <span className="text-[9px] text-gray-500">{
-                track === "Video" ? "V1" : track === "B-Roll" ? "V2" : track === "SFX" ? "A1" : "A2"
-              }</span>
-            </div>
-          ))}
+      {/* 3. PLAYBACK CONTROLS */}
+      <div className="h-12 bg-[#0a0a0a] flex items-center justify-between px-4 shrink-0 border-b border-zinc-800">
+        <div className="flex items-center gap-4 text-zinc-400">
+          <button onClick={handleUndo} className="p-1.5 hover:text-white transition"><Undo size={18} /></button>
+          <button onClick={handleRedo} className="p-1.5 hover:text-white transition"><Redo size={18} /></button>
         </div>
-        <div
-          ref={timelineScrollerRef}
-          className="flex-1 relative overflow-x-auto overflow-y-hidden no-scrollbar"
-          onScroll={(event) => {
-            const scroller = event.currentTarget;
-            updateTimelineTime(scroller.scrollLeft / PIXELS_PER_SECOND);
-          }}
-        >
-          <div className="absolute top-0 bottom-0 left-1/2 w-[2px] bg-white z-30 -translate-x-1/2">
-            <div className="absolute -top-1 left-1/2 -translate-x-1/2 w-2 h-3 bg-white rounded-sm"></div>
-          </div>
-          <div className="flex h-full min-w-max pl-[50%] pr-[50%]">
-            <div className="absolute top-0 left-0 right-0 h-6 border-b border-[#222] bg-[#1a1a1a]"></div>
-            {uniqueTracks.map((track) => (
-              <div key={track} className="relative w-[200vw] h-10 border-b border-[#222] mt-6">
-                {track === "Video" ? clips.map((clip) => (
+        <div className="text-xs font-mono text-zinc-400">
+          {formatTime(currentTime)} / {formatTime(timelineDuration)}
+        </div>
+        <button onClick={() => setIsFullscreen(true)} className="text-zinc-400 hover:text-white"><Maximize size={18} /></button>
+      </div>
+
+      {/* 4. TIMELINE */}
+      <div className="h-44 bg-[#0a0a0a] flex flex-col shrink-0 relative border-b border-zinc-800">
+        <div ref={timelineScrollerRef} className="flex-1 overflow-x-auto overflow-y-hidden relative custom-scrollbar">
+          <div className="min-w-max h-full flex flex-col relative" style={{ width: `${Math.max(100, timelineDuration * PIXELS_PER_SECOND)}px` }}>
+            {/* Timeline Ruler */}
+            <div className="h-6 border-b border-zinc-800/50 flex items-end relative select-none">
+              {Array.from({length: Math.ceil(timelineDuration) + 1 }).map((_, i) => (
+                <div key={i} className="absolute flex flex-col items-center justify-end h-full text-[9px] text-zinc-600 border-l border-zinc-800/50 pb-1" style={{ left: `${i * PIXELS_PER_SECOND}px` }}>
+                  {formatTime(i)}
+                </div>
+              ))}
+            </div>
+
+            {/* Tracks */}
+            {["V1", "V2", "A1", "A2"].map((track) => (
+              <div key={track} className="flex-1 min-h-[28px] flex items-center border-b border-zinc-800/50 relative group">
+                <div className="w-12 bg-[#0a0a0a] border-r border-zinc-800/50 h-full flex items-center justify-center text-[10px] text-zinc-500 z-10 sticky left-0">
+                  {track}
+                </div>
+                <div className="flex-1 relative h-full">
+                  {track === "V1" && clips.map((clip) => (
                     <div
                       key={clip.id}
-                      role="button"
-                      tabIndex={0}
                       onClick={() => {
                         setSelectedClipId(clip.id);
-                        setSelectedBrollClipId(null);
-                        seekTimeline(clip.start);
+                        setSelectedClipTimeStr(formatTime(clip.start));
                       }}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          setSelectedClipId(clip.id);
-                          setSelectedBrollClipId(null);
-                        }
-                      }}
-                      style={{
-                        left: `${clip.start * PIXELS_PER_SECOND}px`,
-                        width: `${Math.max(4, (clip.end - clip.start) * PIXELS_PER_SECOND)}px`,
-                      }}
-                      className={`absolute top-0 h-full bg-[#4ECDC4]/20 border border-[#4ECDC4] rounded-sm overflow-hidden flex items-center ${selectedClipId === clip.id ? "ring-1 ring-[#4ECDC4]" : ""}`}
+                      className={`absolute top-1 bottom-1 rounded-sm overflow-hidden border bg-[#4ECDC4]/20 border-[#4ECDC4] ${selectedClipId === clip.id ? "ring-2 ring-white z-10" : ""}`}
+                      style={{ left: `${clip.start * PIXELS_PER_SECOND}px`, width: `${(clip.end - clip.start) * PIXELS_PER_SECOND}px` }}
                     >
-                      {clip.zoomEffects.map((effect) => {
-                        const start = Math.max(effect.start, clip.start);
-                        const end = Math.min(effect.end, clip.end);
-                        return (
-                          <span
-                            key={effect.id}
-                            aria-label={`V1 zoom: ${effect.effect.replace(/_/gu, " ")}`}
-                            style={{
-                              left: `${(start - clip.start) * PIXELS_PER_SECOND}px`,
-                              width: `${Math.max(4, (end - start) * PIXELS_PER_SECOND)}px`,
-                            }}
-                            className="pointer-events-none absolute top-0 h-full border border-blue-300/80 bg-blue-400/40"
-                          />
-                        );
-                      })}
-                      <span className="relative z-10 text-[10px] text-white px-1">Video</span>
+                      <span className="text-[10px] text-white px-1 truncate">Video</span>
                     </div>
-                  )) : track === "B-Roll" ? brollClips.filter((clip) => clip.track === "v2").map((clip) => (
+                  ))}
+                  {track === "V1" && silenceReview.map((candidate) => (
                     <div
-                      key={clip.id}
-                      role="button"
-                      tabIndex={0}
-                      aria-label={`B-Roll placeholder: ${clip.prompt}`}
+                      key={candidate.id}
+                      title={`Silence candidate for review: ${formatTime(candidate.start)}–${formatTime(candidate.end)}`}
+                      className="absolute top-1 bottom-1 z-10 rounded-sm border border-amber-300 bg-amber-400/40 pointer-events-none"
+                      style={{
+                        left: `${candidate.start * PIXELS_PER_SECOND}px`,
+                        width: `${Math.max(4, (candidate.end - candidate.start) * PIXELS_PER_SECOND)}px`,
+                      }}
+                    />
+                  ))}
+                  {track === "V1" && reviewSegments.filter((segment) => segment.isSuggestedCut).map((segment) => (
+                    <button
+                      key={segment.id}
+                      type="button"
+                      title={`Suggested cut: ${segment.text}${segment.explanation ? `. ${segment.explanation}` : ""}${segment.bestTakeText ? ` Best take: ${segment.bestTakeText}` : ""}`}
+                      aria-label={`Select suggested cut: ${segment.text}${segment.explanation ? `. ${segment.explanation}` : ""}${segment.bestTakeText ? ` Best take: ${segment.bestTakeText}` : ""}`}
+                      aria-pressed={selectedCutIds.has(segment.id)}
                       onClick={() => {
-                        setSelectedClipId(clip.id);
-                        setSelectedBrollClipId(clip.id);
+                        setSelectedCutIds((selected) => {
+                          const next = new Set(selected);
+                          if (next.has(segment.id)) next.delete(segment.id);
+                          else next.add(segment.id);
+                          return next;
+                        });
+                        previewSuggestion(segment);
                       }}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          setSelectedClipId(clip.id);
-                          setSelectedBrollClipId(clip.id);
-                        }
-                      }}
+                      className={`absolute top-1 bottom-1 z-20 rounded-sm border ${selectedCutIds.has(segment.id) ? "bg-red-500/80 border-white ring-1 ring-white" : "bg-red-500/50 border-red-300 hover:bg-red-500/70"}`}
                       style={{
-                        left: `${clip.start * PIXELS_PER_SECOND}px`,
-                        width: `${Math.max(12, (clip.end - clip.start) * PIXELS_PER_SECOND)}px`,
+                        left: `${segment.start * PIXELS_PER_SECOND}px`,
+                        width: `${Math.max(4, (segment.end - segment.start) * PIXELS_PER_SECOND)}px`,
                       }}
-                      className={`absolute top-0 flex h-full items-center gap-1 overflow-hidden rounded-sm border border-dashed border-[#4ECDC4] bg-[#4ECDC4]/10 px-1 text-[9px] text-white ${selectedClipId === clip.id ? "ring-1 ring-[#4ECDC4]" : ""}`}
-                    >
-                      {clip.url && clip.assetType === "image" ? (
-                        <img src={clip.url} alt="" className="h-full min-w-0 flex-1 object-cover" />
-                      ) : clip.url && clip.assetType === "video" ? (
-                        <span className="truncate">{clip.prompt}</span>
-                      ) : (
-                        <>
-                          <Upload size={12} className="shrink-0 text-[#4ECDC4]" />
-                          <span className="truncate">{clip.prompt}</span>
-                        </>
-                      )}
-                    </div>
-                  )) : track === "SFX" || track === "Music" ? audioClips.filter((clip) =>
-                    track === "SFX" ? clip.track === "a1" : clip.track === "a2",
-                  ).map((clip) => (
-                    <div
-                      key={clip.id}
-                      role="button"
-                      tabIndex={0}
-                      aria-label={`${track} clip: ${clip.title}`}
-                      onClick={() => seekTimeline(clip.start)}
-                      style={{
-                        left: `${clip.start * PIXELS_PER_SECOND}px`,
-                        width: `${Math.max(12, (clip.end - clip.start) * PIXELS_PER_SECOND)}px`,
-                      }}
-                      className={`absolute top-0 flex h-full items-center overflow-hidden rounded-sm border px-1 text-[9px] text-white ${track === "SFX" ? "border-orange-400/70 bg-orange-400/20" : "border-purple-400/70 bg-purple-400/20"}`}
-                    >
-                      <span className="truncate">{clip.title}</span>
-                    </div>
-                  )) : null}
+                    />
+                  ))}
+                </div>
               </div>
             ))}
+
+            {manualRangeStart !== null && manualRangeEnd !== null && (
+              <div
+                className="absolute top-6 bottom-0 z-10 border-x border-cyan-300 bg-cyan-400/15 pointer-events-none"
+                style={{
+                  left: `${manualRangeStart * PIXELS_PER_SECOND}px`,
+                  width: `${(manualRangeEnd - manualRangeStart) * PIXELS_PER_SECOND}px`,
+                }}
+              />
+            )}
+            {manualRangeStart !== null && manualRangeEnd === null && (
+              <div
+                className="absolute top-6 bottom-0 z-10 w-0.5 bg-cyan-300 pointer-events-none"
+                style={{left: `${manualRangeStart * PIXELS_PER_SECOND}px`}}
+              />
+            )}
+
+            {/* Playhead */}
+            <div className="absolute top-0 bottom-0 w-px bg-white z-30 pointer-events-none" style={{ left: `${currentTime * PIXELS_PER_SECOND}px` }}>
+              <div className="w-3 h-3 bg-white -ml-1.5 rounded-sm" />
+            </div>
           </div>
+        </div>
+        <div className="h-12 shrink-0 bg-[#111] flex items-center gap-3 px-3 text-[10px] overflow-x-auto whitespace-nowrap">
+          <button
+            type="button"
+            onClick={() => {
+              if (!activeVideoClip) return;
+              setSelectedClipId(activeVideoClip.id);
+              setSelectedClipTimeStr(formatTime(activeVideoClip.start));
+            }}
+            disabled={!activeVideoClip}
+            className="text-zinc-400 hover:text-white disabled:opacity-40"
+          >
+            Select clip
+          </button>
+          <button type="button" onClick={markManualRangeStart} disabled={!activeVideoClip} className="text-zinc-400 hover:text-white disabled:opacity-40">
+            Mark Start
+          </button>
+          <button type="button" onClick={markManualRangeEnd} disabled={manualRangeStart === null || !activeVideoClip} className="text-zinc-400 hover:text-white disabled:opacity-40">
+            Mark End
+          </button>
+          <button type="button" onClick={deleteManualRange} disabled={manualRangeStart === null || manualRangeEnd === null} className="text-red-400 hover:text-red-300 font-bold disabled:opacity-40">
+            Delete Range
+          </button>
+          <button type="button" onClick={deleteSelectedClip} disabled={!selectedClipId} className="text-red-400 hover:text-red-300 disabled:opacity-40">
+            Ripple Delete
+          </button>
+          {reviewSegments.length > 0 && (
+            <button type="button" onClick={deleteSelectedSuggestions} disabled={selectedCutIds.size === 0} className="text-red-400 hover:text-red-300 disabled:opacity-40">
+              Delete Retakes ({selectedCutIds.size})
+            </button>
+          )}
+          <label className="flex items-center gap-1 text-zinc-400">
+            Silence ≥
+            <input
+              type="number"
+              min="0.2"
+              max="10"
+              step="0.1"
+              value={minimumSilenceDuration}
+              onChange={(event) => {
+                const value = Number(event.target.value);
+                if (Number.isFinite(value) && value >= 0.2 && value <= 10) setMinimumSilenceDuration(value);
+              }}
+              className="w-12 rounded bg-zinc-800 px-1 py-0.5 text-white"
+              aria-label="Minimum silence candidate duration in seconds"
+            />
+            s
+          </label>
+          <label className="flex items-center gap-1 text-zinc-400">
+            Threshold
+            <input
+              type="number"
+              min="-60"
+              max="-10"
+              step="1"
+              value={silenceThresholdDb}
+              onChange={(event) => {
+                const value = Number(event.target.value);
+                if (Number.isFinite(value) && value >= -60 && value <= -10) setSilenceThresholdDb(value);
+              }}
+              className="w-12 rounded bg-zinc-800 px-1 py-0.5 text-white"
+              aria-label="Silence detection threshold in dB"
+            />
+            dB
+          </label>
+          {silenceReview.map((candidate) => (
+            <span key={candidate.id} className="flex items-center gap-1 rounded bg-amber-500/10 px-1.5 py-1 text-amber-200">
+              {formatTime(candidate.start)}–{formatTime(candidate.end)}
+              <button
+                type="button"
+                onClick={() => decideSilenceCandidates([candidate.id], true)}
+                className="text-green-300 hover:text-green-200"
+                aria-label={`Accept silence ${formatTime(candidate.start)} to ${formatTime(candidate.end)}`}
+              >
+                Accept
+              </button>
+              <button
+                type="button"
+                onClick={() => decideSilenceCandidates([candidate.id], false)}
+                className="text-zinc-400 hover:text-white"
+                aria-label={`Reject silence ${formatTime(candidate.start)} to ${formatTime(candidate.end)}`}
+              >
+                Reject
+              </button>
+            </span>
+          ))}
         </div>
       </div>
 
       {/* 5. BOTTOM TOOLBAR */}
-      <footer className="h-16 bg-[#0a0a0a] border-t border-[#222] flex items-center px-2 gap-2 overflow-x-auto shrink-0">
+      <footer className="h-16 bg-[#0a0a0a] flex items-center px-2 gap-2 overflow-x-auto shrink-0 z-30 relative">
+        <input ref={fileInputRef} type="file" accept="video/*" className="hidden" onChange={async (event) => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            try {
+              if (draftId) await saveVideoToOPFS(draftId, file);
+              setVideoSource(file);
+            } catch (error) {
+              console.error("Could not import video:", error);
+              setNotice("Could not import this video.");
+            } finally {
+              event.target.value = "";
+            }
+          }} />
         <button type="button" onClick={() => fileInputRef.current?.click()} className="flex flex-col items-center min-w-[65px] gap-1 text-gray-300">
-          <Plus size={20} />
-          <span className="text-[10px]">Media</span>
+          <Upload size={20} />
+          <span className="text-[10px]">Import</span>
         </button>
-        <button type="button" className="flex flex-col items-center min-w-[65px] gap-1 text-gray-300">
-          <Music size={20} />
-          <span className="text-[10px]">Audio</span>
-        </button>
-        <button type="button" className="flex flex-col items-center min-w-[65px] gap-1 text-gray-300">
-          <Captions size={20} />
-          <span className="text-[10px]">Captions</span>
-        </button>
-        <button type="button" className="flex flex-col items-center min-w-[65px] gap-1 text-gray-300">
-          <Type size={20} />
-          <span className="text-[10px]">Text</span>
-        </button>
-        <button type="button" className="flex flex-col items-center min-w-[65px] gap-1 text-gray-300">
-          <Layout size={20} />
-          <span className="text-[10px]">Overlay</span>
-        </button>
-        <button type="button" className="flex flex-col items-center min-w-[65px] gap-1 text-[#4ECDC4]">
+        <button type="button" onClick={() => setIsEffectsPanelOpen(true)} className="flex flex-col items-center min-w-[65px] gap-1 text-gray-300">
           <Sparkles size={20} />
           <span className="text-[10px]">Effects</span>
         </button>
-        <button type="button" onClick={() => { setMagicEditError(null); setIsMagicEditPlanOpen(true); }} disabled={isGeneratingMagicEditPlan || isAutoCutting || isProcessingScript} className="flex flex-col items-center min-w-[75px] gap-1 text-[#4ECDC4] disabled:opacity-50">
-          <Sparkles size={20} />
-          <span className="text-[10px] font-bold">{isGeneratingMagicEditPlan ? "Planning…" : "Magic Edit"}</span>
+        <button type="button" onClick={() => setIsCaptionPanelOpen(true)} className="flex flex-col items-center min-w-[65px] gap-1 text-[#4ECDC4]">
+          <Captions size={20} />
+          <span className="text-[10px]">Captions</span>
         </button>
-        <button type="button" onClick={() => setIsSheetOpen(true)} className="flex flex-col items-center min-w-[65px] gap-1 text-[#4ECDC4] bg-[#4ECDC4]/10 px-2 py-1 rounded-md">
-          <Scissors size={20} />
-          <span className="text-[10px] font-bold">Auto-Cut</span>
+        {/* AI CHAT BUTTON - Replaces Magic Edit & Auto-Cut */}
+        <button type="button" onClick={() => setViewMode("chat")} className="flex flex-col items-center justify-center min-w-[75px] gap-1 text-black bg-[#4ECDC4] rounded-xl py-1 px-2 shadow-lg ml-auto">
+          <Sparkles size={20} />
+          <span className="text-[10px] font-bold">AI Chat</span>
         </button>
       </footer>
 
-      <input ref={fileInputRef} type="file" accept="video/*" className="hidden" onChange={async (event) => {
-        const file = event.target.files?.[0];
-        if (!file) return;
-        try {
-          if (draftId) await saveVideoToOPFS(draftId, file);
-          setVideoSource(file);
-        } catch (error: unknown) {
-          console.error("Media import failed:", error);
-          setNotice(error instanceof Error ? error.message : "Could not import this video.");
-        } finally {
-          event.target.value = "";
-        }
-      }} />
-      <input ref={brollImageInputRef} type="file" accept="image/*" className="hidden" onChange={(event) => {
-        const file = event.target.files?.[0];
-        if (file && selectedBrollClipId) replaceBrollImage(selectedBrollClipId, file);
-        event.target.value = "";
-      }} />
+      {/* MODALS & OVERLAYS */}
+      {isEffectsPanelOpen && <EffectsPanel onClose={() => setIsEffectsPanelOpen(false)} brightness={brightness} setBrightness={setBrightness} contrast={contrast} setContrast={setContrast} saturation={saturation} setSaturation={setSaturation} />}
+      {isCaptionPanelOpen && <CaptionPanel onImportSRT={handleImportSRT} wordsPerLine={wordsPerLine} setWordsPerLine={setWordsPerLine} style={captionStyle} setStyle={setCaptionStyle} onClose={() => setIsCaptionPanelOpen(false)} onGenerate={async () => { setNotice("AI caption generation is not connected yet."); }} />}
+      {viewMode === "chat" && (
+        <AIChatPanel
+          onClose={closeChat}
+          onCancelAutoCut={cancelAutoCut}
+          selectedClipTime={selectedClipTimeStr}
+          editorContextSummary={editorContextSummary}
+          getEditorContext={getEditorContext}
+          videoContext={chatVideoContext}
+        />
+      )}
 
-      {isSheetOpen && <button type="button" aria-label="Close Auto-Cut" onClick={() => setIsSheetOpen(false)} className="fixed inset-0 z-40 bg-black/60" />}
-      <section role="dialog" aria-modal="true" aria-label="Auto-Cut" className={`fixed bottom-0 left-0 right-0 z-50 flex h-[80vh] flex-col rounded-t-2xl border-t border-[#333] bg-[#1a1a1a] text-white shadow-2xl transition-transform ${isSheetOpen ? "translate-y-0" : "pointer-events-none translate-y-full"}`}>
-        <header className="flex h-14 shrink-0 items-center justify-between border-b border-[#333] px-4">
-          <h2 className="text-sm font-semibold">Auto-Cut</h2>
-          <button type="button" onClick={() => setIsSheetOpen(false)} aria-label="Close" className="rounded-full p-2 text-gray-400 hover:bg-white/10"><X size={18} /></button>
-        </header>
-        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4">
-          <label className="text-xs font-medium text-gray-300">
-            Script
-            <textarea value={script} onChange={(event) => {
-              setScript(event.target.value);
-              setScriptLines([]);
-              setAutoCutError(null);
-            }} disabled={isProcessingScript || isAutoCutting} placeholder="Paste the video script..." rows={3} className="mt-2 h-32 w-full resize-y rounded-lg border border-[#383838] bg-[#111] p-3 text-sm text-white placeholder:text-gray-600 focus:border-[#4ECDC4] focus:outline-none disabled:opacity-60" />
-          </label>
-          <button type="button" onClick={() => void processScriptWithAI()} disabled={!script.trim() || isProcessingScript || isAutoCutting} className="flex w-full shrink-0 items-center justify-center rounded-lg border border-[#4ECDC4]/50 px-4 py-2 text-sm font-medium text-[#4ECDC4] disabled:opacity-40">
-            {isProcessingScript ? "Processing Script…" : "Process Script with AI"}
-          </button>
-          {scriptLines.length > 0 && (
-            <ol aria-label="Processed script lines" className="max-h-40 shrink-0 list-decimal space-y-1 overflow-y-auto rounded-lg border border-[#333] bg-[#111] p-3 pl-8 text-xs text-gray-300">
-              {scriptLines.map((line, index) => <li key={`${index}-${line}`}>{line}</li>)}
-            </ol>
-          )}
-          <label className="text-xs font-medium text-gray-300">
-            Silence threshold · {silenceThreshold.toFixed(1)}s
-            <input aria-label="Silence threshold" type="range" min="0.1" max="2" step="0.1" value={silenceThreshold} onChange={(event) => setSilenceThreshold(Number(event.target.value))} className="mt-2 w-full accent-[#4ECDC4]" />
-          </label>
-          {autoCutError && <p role="alert" className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-200">{autoCutError}</p>}
-          <button type="button" onClick={() => void runAutoCut()} disabled={!videoUrl || isAutoCutting || isProcessingScript || !script.trim() || scriptLines.length === 0} className="mt-auto flex w-full items-center justify-center rounded-lg bg-[#4ECDC4] px-4 py-3 text-sm font-bold text-black disabled:opacity-40">
-            {isAutoCutting ? "Running Auto-Cut…" : "Run Auto-Cut"}
-          </button>
-        </div>
-      </section>
-      {isReviewOpen && (
-        <div className="fixed inset-0 z-[70] flex items-end justify-end bg-black/45 text-white md:items-center md:p-5">
-          <section role="dialog" aria-modal="true" aria-labelledby="review-cuts-title" className="flex h-[76dvh] w-full flex-col overflow-hidden border-t border-[#383838] bg-[#111315] shadow-2xl md:h-full md:max-h-[900px] md:w-[min(560px,52vw)] md:rounded-2xl md:border">
-            <header className="flex shrink-0 items-center justify-between border-b border-[#2b3033] px-5 py-4">
-              <div>
-                <h2 id="review-cuts-title" className="text-lg font-semibold tracking-tight">Text-Based Editing</h2>
-                <p className="mt-1 text-xs text-gray-400">Preview the transcript and choose segments to remove.</p>
-              </div>
-              <button type="button" onClick={closeReview} aria-label="Close Text-Based Editing" className="rounded-full p-2 text-gray-400 hover:bg-white/10 hover:text-white">
-                <X size={20} />
-              </button>
-            </header>
-            <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-4 sm:p-5">
-              {reviewSegments.length === 0 ? (
-                <p className="rounded-xl border border-[#303030] bg-[#191c1e] p-5 text-center text-sm text-gray-400">
-                  No transcript segments were found.
-                </p>
-              ) : reviewSegments.map((segment) => {
-                const isSelected = selectedCutIds.has(segment.id);
-                return (
-                  <article
-                    key={segment.id}
-                    className={`rounded-xl border p-3.5 sm:p-4 transition-colors duration-200 ${isSelected ? "bg-red-900/20 border-red-500/50" : "bg-[#1a1a1a] border-[#333]"}`}
-                  >
-                    <div className="mb-2 flex items-center justify-between gap-3">
-                      <div className="flex min-w-0 items-center gap-2">
-                        <span className="font-mono text-xs font-medium tabular-nums text-gray-400">
-                          {formatTime(segment.start)} - {formatTime(segment.end)}
-                        </span>
-                        {segment.isSuggestedCut && (
-                          <span className="rounded-full bg-red-400/10 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-red-300">
-                            Suggested {segment.reason}
-                          </span>
-                        )}
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => playReviewSegment(segment)}
-                        aria-label={`${previewingSegmentId === segment.id ? "Pause" : "Play"} segment ${formatTime(segment.start)} to ${formatTime(segment.end)}`}
-                        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/[0.06] text-white transition-colors hover:bg-white/15"
-                      >
-                        {previewingSegmentId === segment.id
-                          ? <Pause size={14} fill="currentColor" />
-                          : <Play size={14} fill="currentColor" className="ml-0.5" />}
-                      </button>
-                    </div>
-                    <div className="flex items-start justify-between gap-4">
-                      <p className="min-w-0 flex-1 whitespace-pre-wrap break-words text-sm leading-6 text-gray-100">
-                        {segment.text}
-                      </p>
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={isSelected}
-                        aria-label={`${isSelected ? "Remove" : "Keep"} segment ${segment.id}`}
-                        onClick={() => toggleSegment(segment.id)}
-                        className={`relative w-11 h-6 rounded-full transition-colors flex items-center ${isSelected ? "bg-red-500" : "bg-emerald-500"}`}
-                      >
-                        <span className={`absolute left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${isSelected ? "translate-x-5" : "translate-x-0"}`} />
-                      </button>
-                    </div>
-                  </article>
-                );
-              })}
-            </div>
-            <footer className="shrink-0 border-t border-[#2b3033] bg-[#111315] p-4 sm:px-5">
-              <button type="button" onClick={applySelectedCuts} className="w-full rounded-xl bg-[#4ECDC4] px-5 py-3.5 text-sm font-bold text-black transition-colors hover:bg-[#70ded6]">
-                Apply Selected Cuts
-                <span className="ml-2 font-medium opacity-70">({selectedCutIds.size + silenceCuts.length})</span>
-              </button>
-            </footer>
-          </section>
+      {notice && (
+        <div className="absolute bottom-20 left-1/2 -translate-x-1/2 bg-[#242424] px-4 py-2 text-xs text-white shadow-lg rounded-lg z-[100] border border-[#383838]">
+          {notice}
+          <button type="button" onClick={() => setNotice(null)} aria-label="Dismiss" className="ml-3 text-gray-400 hover:text-white"><X size={12} /></button>
         </div>
       )}
-      {isMagicEditPlanOpen && (
-        <div className="fixed inset-0 z-[70] flex items-end justify-end bg-black/55 text-white md:items-center md:p-5">
-          <section role="dialog" aria-modal="true" aria-labelledby="magic-edit-plan-title" className="flex h-[86dvh] w-full flex-col overflow-hidden border-t border-[#383838] bg-[#111315] shadow-2xl md:h-full md:max-h-[900px] md:w-[min(680px,60vw)] md:rounded-2xl md:border">
-            <header className="flex h-14 shrink-0 items-center justify-between border-b border-[#2b3033] px-4">
-              <div>
-                <h2 id="magic-edit-plan-title" className="text-sm font-semibold">Magic Edit Plan</h2>
-                <p className="mt-0.5 text-[10px] text-gray-400">Review Zoom, B-roll, SFX, and Music before applying.</p>
-              </div>
-              <button type="button" onClick={() => setIsMagicEditPlanOpen(false)} aria-label="Close Magic Edit plan" className="rounded-full p-2 text-gray-400 hover:bg-white/10"><X size={18} /></button>
-            </header>
-            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
-              <div className="grid grid-cols-2 gap-3 rounded-xl border border-[#303030] bg-[#191c1e] p-3">
-                <label className="text-[10px] text-gray-400">Editing intensity
-                  <select
-                    value={aiIntensity}
-                    onChange={(event) => {
-                      const intensity = event.target.value;
-                      if (intensity === "subtle" || intensity === "professional" || intensity === "dynamic") {
-                        setAiIntensity(intensity);
-                      }
-                    }}
-                    className="mt-1 w-full rounded-md border border-[#383838] bg-[#111] p-2 text-xs text-white"
-                  >
-                    <option value="subtle">Subtle</option>
-                    <option value="professional">Professional</option>
-                    <option value="dynamic">Dynamic</option>
-                  </select>
-                </label>
-                <label className="text-[10px] text-gray-400">AI model
-                  <select
-                    value={aiModel}
-                    onChange={(event) => {
-                      const model = event.target.value;
-                      if (model === "openrouter" || model === "groq") setAiModel(model);
-                    }}
-                    className="mt-1 w-full rounded-md border border-[#383838] bg-[#111] p-2 text-xs text-white"
-                  >
-                    <option value="openrouter">OpenRouter (Best)</option>
-                    <option value="groq">Groq (Fast)</option>
-                  </select>
-                </label>
-              </div>
-              {magicEditError && <p role="alert" className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-200">{magicEditError}</p>}
-              {isGeneratingMagicEditPlan && <p role="status" className="text-sm text-gray-400">Creating your complete edit plan…</p>}
-              {magicEditPlan.map((item, index) => {
-                const title = item.type === "broll" ? "B-roll" : item.type === "zoom" ? "Zoom" : item.type === "sfx" ? "Sound effect" : "Music";
-                const timeLabel = item.type === "zoom" || item.type === "broll"
-                  ? `${item.start.toFixed(1)}s - ${item.end.toFixed(1)}s`
-                  : item.type === "sfx" ? `${(item.start ?? 0).toFixed(1)}s` : "Full timeline";
-                return (
-                  <article key={item.id} className={`rounded-xl border p-3.5 transition-colors ${item.enabled ? "border-[#4ECDC4]/40 bg-[#4ECDC4]/[0.06]" : "border-[#333] bg-[#191c1e] opacity-60"}`}>
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <h3 className="text-xs font-semibold">{title} {index + 1}</h3>
-                        <p className="mt-1 font-mono text-[11px] text-gray-400">{timeLabel}</p>
-                        {item.type === "zoom" && <p className="mt-2 text-xs text-gray-200">{item.effect.replace(/_/gu, " ")}</p>}
-                        {item.type === "broll" && (
-                          <div className="mt-2 grid grid-cols-2 gap-2">
-                            <label className="text-[10px] text-gray-400">Layout
-                              <select value={item.layout} onChange={(event) => {
-                                const layout = event.target.value as BrollLayout;
-                                setMagicEditPlan((items) => items.map((candidate) =>
-                                  candidate.id === item.id && candidate.type === "broll" ? { ...candidate, layout } : candidate,
-                                ));
-                              }} className="mt-1 w-full rounded-md border border-[#383838] bg-[#111] p-2 text-xs text-white">
-                                <option value="full">Full screen</option>
-                                <option value="split">Split</option>
-                                <option value="pip">Picture-in-Picture</option>
-                              </select>
-                            </label>
-                            <p className="self-end pb-2 text-[10px] text-gray-400">{item.assetType} asset</p>
-                          </div>
-                        )}
-                        {(item.type === "broll" || item.type === "sfx" || item.type === "music") && (
-                          <p className="mt-2 break-words text-xs text-gray-200">
-                            {item.type === "music" ? `${item.mood}: ` : ""}{item.searchQuery}
-                          </p>
-                        )}
-                        {(item.type === "sfx" || item.type === "music") && (
-                          <label className="mt-2 block text-[10px] text-gray-400">Volume · {item.volume}%
-                            <input aria-label={`${title} volume`} type="range" min="0" max="100" step="1" value={item.volume} onChange={(event) => {
-                              const volume = Number(event.target.value);
-                              setMagicEditPlan((items) => items.map((candidate) =>
-                                candidate.id === item.id && (candidate.type === "sfx" || candidate.type === "music")
-                                  ? { ...candidate, volume }
-                                  : candidate,
-                              ));
-                            }} className="mt-1 w-full accent-[#4ECDC4]" />
-                          </label>
-                        )}
-                        {item.asset && <p className="mt-2 truncate text-[10px] text-[#4ECDC4]">Attached: {item.asset.title}</p>}
-                        {(item.type === "broll" || item.type === "sfx" || item.type === "music") && (
-                          <button type="button" onClick={() => openAssetSearch(item)} className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-[#4ECDC4]/40 px-2.5 py-1.5 text-[10px] font-medium text-[#4ECDC4] hover:bg-[#4ECDC4]/10">
-                            <Search size={12} /> Search Asset
-                          </button>
-                        )}
-                      </div>
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={item.enabled}
-                        aria-label={`${item.enabled ? "Turn off" : "Turn on"} ${title} ${index + 1}`}
-                        onClick={() => updateMagicEditItem(item.id, !item.enabled)}
-                        className={`relative mt-1 flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${item.enabled ? "bg-[#4ECDC4]" : "bg-gray-600"}`}
-                      >
-                        <span className={`absolute left-0.5 h-5 w-5 rounded-full bg-white transition-transform ${item.enabled ? "translate-x-5" : "translate-x-0"}`} />
-                      </button>
-                    </div>
-                  </article>
-                );
-              })}
-              {!isGeneratingMagicEditPlan && magicEditPlan.length === 0 && !magicEditError && (
-                <p className="py-8 text-center text-sm text-gray-400">Generate a plan to start reviewing your edit.</p>
-              )}
-            </div>
-            <div className="shrink-0 border-t border-[#2b3033] bg-[#111315]">
-              {magicEditChat.length > 0 && (
-                <div aria-label="Magic Edit conversation" className="max-h-24 space-y-1 overflow-y-auto px-4 pt-3">
-                  {magicEditChat.slice(-4).map((message, index) => (
-                    <p key={`${index}-${message.text}`} className={`text-[10px] ${message.role === "user" ? "text-gray-300" : "text-[#4ECDC4]"}`}>
-                      {message.role === "user" ? "You: " : "Magic Edit: "}{message.text}
-                    </p>
-                  ))}
-                </div>
-              )}
-              <div className="px-4 pt-3">
-                <button
-                  type="button"
-                  onClick={() => void generateMagicEditPlan()}
-                  disabled={isGeneratingMagicEditPlan || isAutoCutting || isProcessingScript}
-                  className="w-full rounded-lg bg-[#4ECDC4] px-4 py-2.5 text-xs font-bold text-black disabled:opacity-40"
-                >
-                  {isGeneratingMagicEditPlan ? "Generating Plan…" : magicEditPlan.length > 0 ? "Regenerate Plan" : "Generate Plan"}
-                </button>
-              </div>
-              <form onSubmit={(event) => {
-                event.preventDefault();
-                const message = magicEditMessage.trim();
-                if (message) void generateMagicEditPlan(message);
-              }} className="flex gap-2 p-4">
-                <input value={magicEditMessage} onChange={(event) => setMagicEditMessage(event.target.value)} disabled={isGeneratingMagicEditPlan} aria-label="Ask to revise the Magic Edit plan" placeholder="Make zooms faster, add more b-roll…" className="min-w-0 flex-1 rounded-lg border border-[#383838] bg-[#0b0c0d] px-3 py-2.5 text-xs text-white outline-none placeholder:text-gray-600 focus:border-[#4ECDC4]" />
-                <button type="submit" disabled={!magicEditMessage.trim() || isGeneratingMagicEditPlan || magicEditPlan.length === 0} className="rounded-lg border border-[#383838] px-3 text-xs font-medium text-white disabled:opacity-40">Send</button>
-              </form>
-              <div className="px-4 pb-4">
-                <button type="button" onClick={applyMagicEditPlan} disabled={magicEditPlan.length === 0 || !magicEditPlan.some((item) => item.enabled) || isGeneratingMagicEditPlan} className="w-full rounded-xl bg-[#4ECDC4] px-5 py-3.5 text-sm font-bold text-black transition-colors hover:bg-[#70ded6] disabled:opacity-40">
-                  Apply Plan
-                </button>
-              </div>
-            </div>
-          </section>
-        </div>
-      )}
-      {selectedBrollClip && (
-        <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/55 text-white md:items-center md:p-5">
-          <section role="dialog" aria-modal="true" aria-labelledby="broll-inspector-title" className="w-full rounded-t-2xl border-t border-[#383838] bg-[#111315] p-5 shadow-2xl md:max-w-md md:rounded-2xl md:border">
-            <header className="mb-4 flex items-center justify-between">
-              <h2 id="broll-inspector-title" className="text-sm font-semibold">{selectedBrollClip.url ? "B-Roll Asset" : "B-Roll Placeholder"}</h2>
-              <button type="button" onClick={() => {
-                setSelectedBrollClipId(null);
-                setSelectedClipId(null);
-              }} aria-label="Close B-Roll inspector" className="rounded-full p-2 text-gray-400 hover:bg-white/10"><X size={18} /></button>
-            </header>
-            <p className="mb-3 font-mono text-xs text-gray-400">{selectedBrollClip.start.toFixed(1)}s - {selectedBrollClip.end.toFixed(1)}s · {selectedBrollClip.layout} · {selectedBrollClip.assetType}</p>
-            <p className="mb-3 text-sm leading-6 text-gray-200">{selectedBrollClip.prompt}</p>
-            <button type="button" onClick={() => void copyBrollPrompt(selectedBrollClip.prompt)} className="mb-5 inline-flex items-center justify-center gap-2 rounded-lg border border-[#383838] px-4 py-2 text-sm text-white hover:bg-white/10">
-              <Copy size={14} />
-              Copy Prompt
-            </button>
-            {selectedBrollClip.url && selectedBrollClip.assetType === "image" && <img src={selectedBrollClip.url} alt={selectedBrollClip.prompt} className="mb-4 max-h-48 w-full rounded-lg object-contain" />}
-            {selectedBrollClip.url && selectedBrollClip.assetType === "video" && <video src={selectedBrollClip.url} controls className="mb-4 max-h-48 w-full rounded-lg object-contain" />}
-            <fieldset className="mb-5 rounded-lg border border-[#383838] p-3">
-              <legend className="px-1 text-xs font-semibold text-white">Transform</legend>
-              <label className="mb-3 block text-[11px] text-gray-400">
-                Position X · {selectedBrollClip.transform.x}
-                <input aria-label="Position X" type="range" min="-100" max="100" step="1" value={selectedBrollClip.transform.x} onChange={(event) => updateBrollTransform(selectedBrollClip.id, { x: Number(event.target.value) })} className="mt-1 w-full accent-[#4ECDC4]" />
-              </label>
-              <label className="mb-3 block text-[11px] text-gray-400">
-                Position Y · {selectedBrollClip.transform.y}
-                <input aria-label="Position Y" type="range" min="-100" max="100" step="1" value={selectedBrollClip.transform.y} onChange={(event) => updateBrollTransform(selectedBrollClip.id, { y: Number(event.target.value) })} className="mt-1 w-full accent-[#4ECDC4]" />
-              </label>
-              <label className="mb-3 block text-[11px] text-gray-400">
-                Scale · {selectedBrollClip.transform.scale.toFixed(1)}
-                <input aria-label="Scale" type="range" min="0.1" max="3" step="0.1" value={selectedBrollClip.transform.scale} onChange={(event) => updateBrollTransform(selectedBrollClip.id, { scale: Number(event.target.value) })} className="mt-1 w-full accent-[#4ECDC4]" />
-              </label>
-              <label className="block text-[11px] text-gray-400">
-                Rotation · {selectedBrollClip.transform.rotation}°
-                <input aria-label="Rotation" type="range" min="-180" max="180" step="1" value={selectedBrollClip.transform.rotation} onChange={(event) => updateBrollTransform(selectedBrollClip.id, { rotation: Number(event.target.value) })} className="mt-1 w-full accent-[#4ECDC4]" />
-              </label>
-            </fieldset>
-            <button type="button" onClick={() => brollImageInputRef.current?.click()} className="flex w-full items-center justify-center gap-2 rounded-lg bg-[#4ECDC4] px-4 py-3 text-sm font-bold text-black">
-              <Upload size={16} />
-              {selectedBrollClip.url ? "Replace Image" : "Upload Image"}
-            </button>
-          </section>
-        </div>
-      )}
-      {selectedVideoClip && !selectedBrollClip && (
-        <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/55 text-white md:items-center md:p-5">
-          <section role="dialog" aria-modal="true" aria-labelledby="video-inspector-title" className="w-full rounded-t-2xl border-t border-[#383838] bg-[#111315] p-5 shadow-2xl md:max-w-md md:rounded-2xl md:border">
-            <header className="mb-4 flex items-center justify-between">
-              <h2 id="video-inspector-title" className="text-sm font-semibold">Video Properties</h2>
-              <button type="button" onClick={() => setSelectedClipId(null)} aria-label="Close Video Properties" className="rounded-full p-2 text-gray-400 hover:bg-white/10"><X size={18} /></button>
-            </header>
-            <p className="mb-4 font-mono text-xs text-gray-400">{selectedVideoClip.start.toFixed(1)}s - {selectedVideoClip.end.toFixed(1)}s · V1</p>
-          </section>
-        </div>
-      )}
-      <AssetSearchPanel
-        isOpen={assetSearch !== null}
-        draftId={draftId}
-        initialType={assetSearch?.type ?? "video"}
-        initialQuery={assetSearch?.query ?? ""}
-        onClose={() => setAssetSearch(null)}
-        onSelect={attachPlanAsset}
-      />
-      {notice && <div role="status" className="fixed bottom-20 left-1/2 z-[60] -translate-x-1/2 rounded-lg border border-[#383838] bg-[#242424] px-4 py-2 text-xs text-white shadow-lg">{notice}<button type="button" onClick={() => setNotice(null)} aria-label="Dismiss notification" className="ml-3 text-gray-400"><X size={12} /></button></div>}
     </div>
   );
 }
